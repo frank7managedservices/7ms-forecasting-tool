@@ -1,12 +1,11 @@
 # 7MS Forecasting Tool
 
-Internal tool for 7 Managed Services SA.
+A forecasting tool for 7 Managed Services.
 
-This application will manage:
+## Purpose
 
-- Monthly forecasting
-- Payroll imports
-- Sage actuals
-- 30-day and 90-day cash flow
-- Payroll by employee group
-- Internal AI performance assistant
+This project will help create, manage, and review forecasts for business operations.
+
+## Status
+
+Initial project setup in progress.
