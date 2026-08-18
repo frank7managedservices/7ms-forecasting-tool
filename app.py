@@ -1787,6 +1787,11 @@ elif page == "Cash Flow":
             st.subheader("Cash Out (monthly totals)")
             payroll = st.number_input("Payroll — split 15th and month end ($)", min_value=0.0,
                                       value=float(saved["payroll"]), step=1000.0)
+            st.caption(
+                "This is a whole month of payroll. It is paid in two halves, so "
+                + MONEY.format(payroll / 2) + " on the 15th and "
+                + MONEY.format(payroll / 2) + " on the last day."
+            )
             css = st.number_input("CSS / government — month end, in arrears ($)", min_value=0.0,
                                   value=float(saved["css"]), step=500.0)
             pluxee = st.number_input("Pluxee bonus — 15th, in arrears ($)", min_value=0.0,
