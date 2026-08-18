@@ -18,6 +18,11 @@ DEFAULTS = {
     "revenue_mode": "Spread evenly",
     "revenue_day": 20,
     "horizon": 120,
+    "end_date": str(date(date.today().year, 12, 31)),
+    "basis": "Cash - pay when it comes due",
+    "expense_mode": "Spread evenly",
+    "decimo_provision": 0.0,
+    "vacation_provision": 0.0,
     "payroll": 0.0,
     "css": 0.0,
     "pluxee": 0.0,
@@ -410,6 +415,62 @@ def save_settings(values):
         SETTINGS_FILE.write_text(json.dumps(values, indent=2))
 
 
+# ---------------------------------------------------------------------------
+# Two schedules you can edit and keep: what you collect each month, and what
+# each expense costs and the day of the month it actually leaves the bank.
+# ---------------------------------------------------------------------------
+
+EXPENSE_COLUMNS = ["Expense", "Monthly amount", "Day of month"]
+REVENUE_COLUMNS = ["Month", "Expected collections", "Day of month"]
+
+
+def load_expense_schedule():
+    rows = kv_get("expense_schedule")
+    if isinstance(rows, list) and rows:
+        return pd.DataFrame(rows)[EXPENSE_COLUMNS]
+    return pd.DataFrame(columns=EXPENSE_COLUMNS)
+
+
+def save_expense_schedule(frame):
+    frame = frame.dropna(subset=["Expense"])
+    frame = frame[frame["Expense"].astype(str).str.strip() != ""]
+    kv_put("expense_schedule", frame.to_dict("records"))
+    return frame
+
+
+def load_revenue_schedule():
+    rows = kv_get("revenue_schedule")
+    if isinstance(rows, list) and rows:
+        return pd.DataFrame(rows)[REVENUE_COLUMNS]
+    return pd.DataFrame(columns=REVENUE_COLUMNS)
+
+
+def save_revenue_schedule(frame):
+    frame = frame.dropna(subset=["Month"])
+    frame = frame[frame["Month"].astype(str).str.strip() != ""]
+    kv_put("revenue_schedule", frame.to_dict("records"))
+    return frame
+
+
+def months_between(start, end):
+    """List of YYYY-MM labels covering the projection window."""
+    out, y, m = [], start.year, start.month
+    while (y, m) <= (end.year, end.month):
+        out.append(f"{y:04d}-{m:02d}")
+        m += 1
+        if m == 13:
+            y, m = y + 1, 1
+    return out
+
+
+def blank_revenue_schedule(start, end, amount, day):
+    return pd.DataFrame([
+        {"Month": label, "Expected collections": float(amount),
+         "Day of month": int(day)}
+        for label in months_between(start, end)
+    ])
+
+
 def days_in_month(d):
     return calendar.monthrange(d.year, d.month)[1]
 
@@ -418,18 +479,60 @@ def is_last_day(d):
     return d.day == days_in_month(d)
 
 
-def build_schedule(s, horizon, severance=None):
-    """Day-by-day cash projection.
+def build_schedule(s, horizon, severance=None, expenses=None, revenues=None):
+    """Day-by-day cash projection on either a cash or an accrual basis.
 
-    The line of credit works two ways at once. A one-time draw lands on the
-    date you pick. On top of that, if automatic draws are on, the model pulls
-    whatever it needs on any day cash would otherwise fall below your minimum,
-    up to the credit limit. Interest is charged in cash at month end on the
-    outstanding balance, and draws are treated as cash in, not revenue.
+    Cash basis: money leaves on the day it actually leaves. Decimo hits on
+    15 April, 15 August and 15 December. Vacation is not charged monthly; it
+    only appears when someone is actually paid out.
+
+    Accrual basis: decimo and vacation are charged as smooth monthly
+    provisions, the way the books carry them, and the three decimo payments
+    are not charged again since they were already provisioned. Over a full
+    year both bases move the same total, they just distribute it differently.
+
+    Expenses can either be spread evenly across each month or taken from a
+    schedule where every line has its own due day. Collections can be one
+    figure every month or a different figure per month.
+
+    The line of credit tops cash back up to your floor whenever a day would
+    otherwise fall below it, and a one-time draw lands on the date you pick.
     """
     severance = severance or {}
     start = date.today()
     balance = s["start_cash"]
+
+    accrual = str(s.get("basis", "")).lower().startswith("accrual")
+
+    decimo_provision = float(s.get("decimo_provision", 0.0))
+    vacation_provision = float(s.get("vacation_provision", 0.0))
+
+    use_expense_schedule = (
+        str(s.get("expense_mode", "")).lower().startswith("use")
+        and expenses is not None and not expenses.empty
+    )
+    if use_expense_schedule:
+        due = {}
+        for _, r in expenses.iterrows():
+            try:
+                day = int(r["Day of month"])
+                amount = float(r["Monthly amount"])
+            except Exception:
+                continue
+            due[max(1, min(day, 31))] = due.get(max(1, min(day, 31)), 0.0) + amount
+
+    by_month = (
+        str(s.get("revenue_mode", "")).lower().startswith("enter")
+        and revenues is not None and not revenues.empty
+    )
+    if by_month:
+        plan = {}
+        for _, r in revenues.iterrows():
+            try:
+                plan[str(r["Month"]).strip()] = (
+                    float(r["Expected collections"]), int(r["Day of month"]))
+            except Exception:
+                continue
 
     loc_limit = float(s.get("loc_limit", 0.0))
     loc_balance = float(s.get("loc_drawn", 0.0))
@@ -446,8 +549,12 @@ def build_schedule(s, horizon, severance=None):
     for i in range(horizon):
         d = start + timedelta(days=i)
         dim = days_in_month(d)
+        label = f"{d.year:04d}-{d.month:02d}"
 
-        if s["revenue_mode"] == "Spread evenly":
+        if by_month:
+            amount, day = plan.get(label, (0.0, int(s.get("revenue_day", 20))))
+            collections = amount if d.day == min(day, dim) else 0.0
+        elif s["revenue_mode"] == "Spread evenly":
             collections = s["revenue"] / dim
         else:
             collections = s["revenue"] if d.day == min(s["revenue_day"], dim) else 0.0
@@ -455,15 +562,30 @@ def build_schedule(s, horizon, severance=None):
         pay = s["payroll"] / 2 if (d.day == 15 or is_last_day(d)) else 0.0
         css_out = s["css"] if is_last_day(d) else 0.0
         pluxee_out = s["pluxee"] if d.day == 15 else 0.0
-        decimo_out = s.get("decimo", 0.0) if (d.day == 15 and d.month in (4, 8, 12)) else 0.0
         viatico_out = s["viatico"] if d.day == 15 else 0.0
-        fixed_out = s["fixed"] / dim
         sev_out = severance.get(d, 0.0)
 
-        # Interest on the line of credit is paid in cash at month end.
+        if accrual:
+            # Provisioned monthly at month end, so the lump payments are not
+            # charged a second time.
+            decimo_out = 0.0
+            provision = (decimo_provision + vacation_provision) if is_last_day(d) else 0.0
+        else:
+            decimo_out = (s.get("decimo", 0.0)
+                          if (d.day == 15 and d.month in (4, 8, 12)) else 0.0)
+            provision = 0.0
+
+        if use_expense_schedule:
+            fixed_out = due.get(min(d.day, dim), 0.0)
+            # Anything due after the last day of a short month lands on that day.
+            if d.day == dim:
+                fixed_out += sum(v for k, v in due.items() if k > dim)
+        else:
+            fixed_out = s["fixed"] / dim
+
         interest = loc_balance * loc_rate / 12 if (is_last_day(d) and loc_rate) else 0.0
 
-        out = (pay + css_out + pluxee_out + viatico_out + decimo_out
+        out = (pay + css_out + pluxee_out + viatico_out + decimo_out + provision
                + sev_out + fixed_out + interest)
 
         draw = 0.0
@@ -493,6 +615,7 @@ def build_schedule(s, horizon, severance=None):
             "Pluxee": pluxee_out,
             "Viatico": viatico_out,
             "Decimo": decimo_out,
+            "Provisions": provision,
             "Severance": sev_out,
             "Other Fixed": fixed_out,
             "Interest": interest,
@@ -509,12 +632,15 @@ def monthly_summary(df):
     out = df.copy()
     out["Month"] = pd.to_datetime(out["Date"]).dt.strftime("%Y-%m")
     cols = ["Collections", "Credit Draw", "Payroll", "CSS / Government", "Pluxee",
-            "Viatico", "Decimo", "Severance", "Other Fixed", "Interest", "Net"]
+            "Viatico", "Decimo", "Provisions", "Severance", "Other Fixed",
+            "Interest", "Net"]
     g = out.groupby("Month", as_index=False)[cols].sum()
     g["Ending Balance"] = out.groupby("Month")["Balance"].last().values
+    g["Starting Balance"] = g["Ending Balance"] - g["Net"]
     g["Credit Balance"] = out.groupby("Month")["Credit Balance"].last().values
     g["Days Counted"] = out.groupby("Month")["Date"].size().values
-    return g
+    lead = ["Month", "Starting Balance"]
+    return g[lead + [c for c in g.columns if c not in lead]]
 
 
 def money_table(df):
@@ -540,8 +666,8 @@ def _read_any(file, name):
 def read_income_statement(file, name):
     """Parse a Sage 50 12-period income statement into tidy rows.
 
-    Returns (lines, totals, periods) where lines has Section / Line / periods
-    and totals has one row per total or subtotal line.
+    Returns (lines, totals) where lines has Section / Line / Period 1..12 and
+    totals has one row per total or subtotal line.
     """
     raw = _read_any(file, name)
 
@@ -680,8 +806,13 @@ if page == "Dashboard":
     st.write("Overview of forecast vs actual, cash position, and payroll.")
     saved = load_settings()
     sev = scheduled_payments(load_terminations())
-    days = int(saved.get("horizon", 120))
-    df = build_schedule(saved, days, sev)
+    try:
+        target = date.fromisoformat(str(saved.get("end_date"))[:10])
+        days = max((target - date.today()).days + 1, 30)
+    except Exception:
+        days = int(saved.get("horizon", 120))
+    df = build_schedule(saved, days, sev, load_expense_schedule(),
+                        load_revenue_schedule())
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Cash on hand", MONEY.format(saved["start_cash"]))
     c2.metric("Balance in 30 days", MONEY.format(df["Balance"].iloc[min(29, days - 1)]))
@@ -979,7 +1110,7 @@ elif page == "Terminations":
         unpaid = sum(float(r["total"]) for r in records if not r.get("paid"))
         st.metric("Total unpaid severance", MONEY.format(unpaid))
 
-        labels = [f"{i}: {r.get('name')} - {r.get('payment_date')} - "
+        labels = [f"{i}: {r.get('name')} — {r.get('payment_date')} — "
                   f"{MONEY.format(float(r.get('total', 0)))}"
                   for i, r in enumerate(records)]
         pick = st.selectbox("Select a record", labels) if labels else None
@@ -1279,6 +1410,16 @@ elif page == "Cash Flow":
     st.write("Cash position projected forward from today using your payment timing rules.")
     saved = load_settings()
 
+    try:
+        default_end = date.fromisoformat(str(saved.get("end_date"))[:10])
+    except Exception:
+        default_end = date(date.today().year, 12, 31)
+    if default_end <= date.today():
+        default_end = date(date.today().year + 1, 12, 31)
+
+    saved_expenses = load_expense_schedule()
+    saved_revenues = load_revenue_schedule()
+
     with st.form("cash_inputs"):
         a, b = st.columns(2)
 
@@ -1288,32 +1429,67 @@ elif page == "Cash Flow":
                                          value=float(saved["start_cash"]), step=1000.0)
             revenue = st.number_input("Monthly collections ($)", min_value=0.0,
                                       value=float(saved["revenue"]), step=1000.0)
+            revenue_choices = ["Spread evenly", "One day per month",
+                               "Enter each month below"]
             revenue_mode = st.radio(
-                "Collections timing", ["Spread evenly", "One day per month"],
-                index=0 if saved["revenue_mode"] == "Spread evenly" else 1,
+                "Collections timing", revenue_choices,
+                index=(revenue_choices.index(saved["revenue_mode"])
+                       if saved["revenue_mode"] in revenue_choices else 0),
             )
             revenue_day = st.number_input("Collection day of month", 1, 31,
                                           int(saved["revenue_day"]))
-            horizon = st.number_input(
-                "Days to project", 30, 730, int(saved.get("horizon", 120)), step=30,
-                help="90 days stops mid-month, which can cut off the last "
-                     "collection. 120 or more gives you whole months.")
+            end_date = st.date_input(
+                "Project through", value=default_end,
+                min_value=date.today() + timedelta(days=1),
+                help="Runs to this date, so pick a month end and no month "
+                     "gets cut in half.")
 
         with b:
             st.subheader("Cash Out (monthly totals)")
-            payroll = st.number_input("Payroll - split 15th and month end ($)", min_value=0.0,
+            payroll = st.number_input("Payroll — split 15th and month end ($)", min_value=0.0,
                                       value=float(saved["payroll"]), step=1000.0)
-            css = st.number_input("CSS / government - month end, in arrears ($)", min_value=0.0,
+            css = st.number_input("CSS / government — month end, in arrears ($)", min_value=0.0,
                                   value=float(saved["css"]), step=500.0)
-            pluxee = st.number_input("Pluxee bonus - 15th, in arrears ($)", min_value=0.0,
+            pluxee = st.number_input("Pluxee bonus — 15th, in arrears ($)", min_value=0.0,
                                      value=float(saved["pluxee"]), step=100.0)
-            viatico = st.number_input("Viatico - 15th ($)", min_value=0.0,
+            viatico = st.number_input("Viatico — 15th ($)", min_value=0.0,
                                       value=float(saved["viatico"]), step=100.0)
             decimo = st.number_input(
-                "Decimo - 15 Apr, 15 Aug, 15 Dec ($ per payment)", min_value=0.0,
+                "Decimo — 15 Apr, 15 Aug, 15 Dec ($ per payment)", min_value=0.0,
                 value=float(saved.get("decimo", 0.0)), step=1000.0)
             fixed = st.number_input("All other fixed expenses ($)", min_value=0.0,
                                     value=float(saved["fixed"]), step=500.0)
+            expense_choices = ["Spread evenly", "Use my due-date schedule"]
+            expense_mode = st.radio(
+                "Other fixed expense timing", expense_choices,
+                index=(expense_choices.index(saved.get("expense_mode",
+                                                       "Spread evenly"))
+                       if saved.get("expense_mode") in expense_choices else 0),
+                help="The schedule replaces the figure above with your own "
+                     "lines, each on the day it comes due.")
+
+        st.subheader("Accounting basis")
+        st.caption(
+            "Cash basis moves money on the day it actually leaves the bank, so "
+            "decimo lands as a lump on 15 April, 15 August and 15 December and "
+            "vacation is charged only when someone is paid out. Accrual basis "
+            "charges a smooth monthly provision for decimo and vacation the way "
+            "your books carry them, and does not charge the lump payments again. "
+            "You can switch between the two views after calculating."
+        )
+        v1, v2 = st.columns(2)
+        with v1:
+            decimo_provision = st.number_input(
+                "Decimo provision per month ($)", min_value=0.0,
+                value=float(saved.get("decimo_provision", 0.0)), step=1000.0,
+                help="Accrual view only. One third of a decimo payment is the "
+                     "usual figure, since each payment covers four months.")
+        with v2:
+            vacation_provision = st.number_input(
+                "Vacation provision per month ($)", min_value=0.0,
+                value=float(saved.get("vacation_provision", 0.0)), step=1000.0,
+                help="Accrual view only. What you set aside each month for "
+                     "vacation you have not paid out yet.")
 
         st.subheader("Line of Credit")
         st.caption(
@@ -1354,9 +1530,56 @@ elif page == "Cash Flow":
                                          value=default_draw_day,
                                          min_value=date(2000, 1, 1))
 
+        with st.expander("Expenses with their own due day"):
+            st.caption(
+                "One row per expense: the monthly amount and the day of the "
+                "month it comes due. Rent on the 5th, insurance on the 10th, "
+                "and so on. A day past the end of a short month lands on the "
+                "last day instead. This is only used when the timing above is "
+                "set to the due-date schedule."
+            )
+            expense_rows = st.data_editor(
+                saved_expenses if not saved_expenses.empty else
+                pd.DataFrame([
+                    {"Expense": "Rent", "Monthly amount": 0.0, "Day of month": 5},
+                    {"Expense": "Utilities", "Monthly amount": 0.0, "Day of month": 10},
+                    {"Expense": "Insurance", "Monthly amount": 0.0, "Day of month": 15},
+                    {"Expense": "Everything else", "Monthly amount": 0.0, "Day of month": 25},
+                ]),
+                num_rows="dynamic", use_container_width=True, hide_index=True,
+                key="expense_editor",
+            )
+
+        with st.expander("Collections month by month"):
+            st.caption(
+                "Revenue that changes every month goes here. Fill in what you "
+                "expect to collect and the day it arrives. This is only used "
+                "when collections timing is set to enter each month."
+            )
+            base_rev = saved_revenues
+            wanted = months_between(date.today(), default_end)
+            if base_rev.empty:
+                base_rev = blank_revenue_schedule(
+                    date.today(), default_end, saved["revenue"],
+                    int(saved["revenue_day"]))
+            else:
+                have = set(base_rev["Month"].astype(str))
+                extra = [m for m in wanted if m not in have]
+                if extra:
+                    base_rev = pd.concat([base_rev, pd.DataFrame([
+                        {"Month": m, "Expected collections": float(saved["revenue"]),
+                         "Day of month": int(saved["revenue_day"])} for m in extra
+                    ])], ignore_index=True).sort_values("Month")
+            revenue_rows = st.data_editor(
+                base_rev, num_rows="dynamic", use_container_width=True,
+                hide_index=True, key="revenue_editor",
+            )
+
         c1, c2 = st.columns(2)
         calculate = c1.form_submit_button("Calculate cash flow")
         store = c2.form_submit_button("Save these numbers")
+
+    horizon = max((end_date - date.today()).days + 1, 1)
 
     current = {
         "start_cash": start_cash,
@@ -1370,6 +1593,10 @@ elif page == "Cash Flow":
         "decimo": decimo,
         "fixed": fixed,
         "horizon": int(horizon),
+        "end_date": str(end_date),
+        "expense_mode": expense_mode,
+        "decimo_provision": decimo_provision,
+        "vacation_provision": vacation_provision,
         "loc_limit": loc_limit,
         "loc_drawn": loc_drawn,
         "loc_rate": loc_rate,
@@ -1381,12 +1608,33 @@ elif page == "Cash Flow":
 
     if store:
         save_settings(current)
+        save_expense_schedule(pd.DataFrame(expense_rows))
+        save_revenue_schedule(pd.DataFrame(revenue_rows))
         st.success("Saved. These numbers will load automatically next time.")
 
     if calculate or store:
         sev = scheduled_payments(load_terminations())
         days = int(horizon)
-        df = build_schedule(current, days, sev)
+        exp_frame = pd.DataFrame(expense_rows)
+        rev_frame = pd.DataFrame(revenue_rows)
+
+        basis = st.radio(
+            "View", ["Cash basis", "Accrual basis"], horizontal=True,
+            help="Cash basis pays decimo as a lump on the 15th of April, "
+                 "August and December and ignores vacation until it is paid. "
+                 "Accrual basis charges monthly provisions instead.")
+        current = dict(current, basis=basis)
+
+        df = build_schedule(current, days, sev, exp_frame, rev_frame)
+        other = build_schedule(dict(current, basis=(
+            "Accrual basis" if basis == "Cash basis" else "Cash basis")),
+            days, sev, exp_frame, rev_frame)
+        st.caption(
+            f"Ending balance on this basis: {MONEY.format(df['Balance'].iloc[-1])}. "
+            f"On the other basis it would be "
+            f"{MONEY.format(other['Balance'].iloc[-1])}. Projection runs "
+            f"{date.today()} through {end_date}, {days} days."
+        )
         d30 = df.head(30)
 
         m1, m2, m3 = st.columns(3)
@@ -1398,7 +1646,12 @@ elif page == "Cash Flow":
 
         collections_total = df["Collections"].sum()
         payments = int((df["Collections"] > 0).sum()) if current["revenue_mode"] != "Spread evenly" else 0
-        if current["revenue_mode"] == "Spread evenly":
+        if current["revenue_mode"] == "Enter each month below":
+            st.caption(
+                f"Collections taken from your month-by-month table, "
+                f"{MONEY.format(collections_total)} in total over {days} days."
+            )
+        elif current["revenue_mode"] == "Spread evenly":
             st.caption(
                 f"Collections of {MONEY.format(current['revenue'])} per month spread "
                 f"daily, {MONEY.format(collections_total)} over {days} days."
