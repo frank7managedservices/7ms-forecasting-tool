@@ -127,7 +127,8 @@ def summarize(df):
         "employer_cost": float(employer_cost),
         "loans": float(loans),
         "viatico": float(col(df, "VITICO").sum()),
-        "xiii": float(col(df, "XIII_MES").sum() + col(df, "ACUM_XIII").sum()),
+        "decimo_paid": float(col(df, "XIII_MES").sum() + col(df, "XIII_MES_GREP").sum()),
+        "decimo_accrued": float(col(df, "ACUM_XIII").sum() + col(df, "ACUM_XIII_GREP").sum()),
         "overtime": float(col(df, "MONTO_SOBRETIEMPO").sum()),
         "vacation": float(col(df, "VACACIONES").sum()),
     }
@@ -141,6 +142,8 @@ def by_group(df):
             "Base Salary": float(col(g, "SALARIO_MENSUAL").sum()),
             "Regular Pay": float(col(g, "INGRESO_REGULAR").sum()),
             "Overtime": float(col(g, "MONTO_SOBRETIEMPO").sum()),
+            "Decimo Paid": float(col(g, "XIII_MES").sum() + col(g, "XIII_MES_GREP").sum()),
+            "Vacation Paid": float(col(g, "VACACIONES").sum() + col(g, "VACACIONES_GREP").sum()),
             "Viatico": float(col(g, "VITICO").sum()),
             "Gross Pay": float(col(g, "INGRESO_BRUTO").sum()),
             "Deductions": float(col(g, "TOTAL_RETENCIONES").sum()),
