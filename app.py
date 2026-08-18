@@ -663,21 +663,44 @@ elif page == "Sage Actuals":
                 st.error(f"Could not read that file: {exc}")
                 st.stop()
 
+            st.subheader("Periods to average")
+            st.caption(
+                "Totals and tables below always show every period. This range only "
+                "controls the monthly averages and what gets sent to Cash Flow, so "
+                "you can leave out empty months and one-off cleanup months."
+            )
+            r1, r2 = st.columns(2)
+            first = r1.selectbox("From", periods, index=0)
+            last = r2.selectbox("To", periods, index=len(periods) - 1)
+            i_first, i_last = periods.index(first), periods.index(last)
+            if i_first > i_last:
+                i_first, i_last = i_last, i_first
+            avg_periods = periods[i_first:i_last + 1]
+            st.caption(f"Averaging over {len(avg_periods)} period(s): "
+                       f"{avg_periods[0]} through {avg_periods[-1]}")
+
             summary = income_summary(totals, periods)
+            avg_summary = income_summary(totals, avg_periods)
             a, b, c, d = st.columns(4)
             a.metric("Total revenue", MONEY.format(summary["Total Revenues"]))
             b.metric("Cost of sales", MONEY.format(summary["Total Cost of Sales"]))
             c.metric("Operating expenses", MONEY.format(summary["Total Expenses"]))
             d.metric("Net income", MONEY.format(summary["Net Income"]))
 
-            months = len(periods)
-            e, f, g = st.columns(3)
+            months = len(avg_periods)
+            e, f, g, h = st.columns(4)
             e.metric("Gross profit", MONEY.format(summary["Gross Profit"]))
             margin = (summary["Gross Profit"] / summary["Total Revenues"] * 100
                       if summary["Total Revenues"] else 0.0)
             f.metric("Gross margin", f"{margin:.1f}%")
             g.metric("Average monthly revenue",
-                     MONEY.format(summary["Total Revenues"] / months if months else 0))
+                     MONEY.format(avg_summary["Total Revenues"] / months if months else 0))
+            h.metric("Average monthly net income",
+                     MONEY.format(avg_summary["Net Income"] / months if months else 0))
+            st.caption(
+                "The first two figures cover the full statement. The two averages "
+                f"cover {avg_periods[0]} through {avg_periods[-1]} only."
+            )
 
             if summary["Net Income"] < 0:
                 st.error(
@@ -714,9 +737,9 @@ elif page == "Sage Actuals":
             st.divider()
             st.subheader("Send to Cash Flow")
             st.caption(
-                "Non-payroll cost lines averaged per month. Payroll, CSS, viatico, "
-                "and decimo are already tracked separately from the planilla, so "
-                "they are left out of this figure."
+                "Non-payroll cost lines averaged over the periods you selected "
+                "above. Payroll, CSS, viatico, and decimo are already tracked "
+                "separately from the planilla, so they are left out of this figure."
             )
             payroll_words = ["salario", "salary", "xiii", "vacacion", "seguro social",
                              "seguro educativo", "riesgos", "indemniza",
@@ -726,12 +749,18 @@ elif page == "Sage Actuals":
                 lines["Section"].isin(["Cost of Sales", "Expenses"])
                 & ~lines["Line"].str.lower().str.contains("|".join(payroll_words))
             ]
-            monthly_other = other["Total"].sum() / months if months else 0.0
-            st.metric("Average monthly other fixed expenses",
+            other = other.copy()
+            other["Selected Total"] = other[avg_periods].sum(axis=1)
+            monthly_other = (other["Selected Total"].sum() / months
+                             if months else 0.0)
+            o1, o2 = st.columns(2)
+            o1.metric("Average monthly other fixed expenses",
                       MONEY.format(monthly_other))
+            o2.metric(f"Total across {months} period(s)",
+                      MONEY.format(other["Selected Total"].sum()))
             with st.expander("Which lines are included"):
-                money_table(other[["Section", "Line", "Total"]]
-                            .sort_values("Total", ascending=False))
+                money_table(other[["Section", "Line", "Selected Total", "Total"]]
+                            .sort_values("Selected Total", ascending=False))
             if st.button("Use this as my other fixed expenses"):
                 saved = load_settings()
                 saved["fixed"] = round(monthly_other, 2)
