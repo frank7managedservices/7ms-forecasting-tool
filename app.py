@@ -454,6 +454,57 @@ def save_revenue_schedule(frame):
     return frame
 
 
+EXTRA_REVENUE_COLUMNS = ["Stream", "Month", "Expected amount", "Day of month"]
+
+
+def load_extra_revenue():
+    rows = kv_get("extra_revenue")
+    if isinstance(rows, list) and rows:
+        frame = pd.DataFrame(rows)
+        for c in EXTRA_REVENUE_COLUMNS:
+            if c not in frame.columns:
+                frame[c] = 0
+        return frame[EXTRA_REVENUE_COLUMNS]
+    return pd.DataFrame(columns=EXTRA_REVENUE_COLUMNS)
+
+
+def save_extra_revenue(frame):
+    frame = frame.dropna(subset=["Month"])
+    frame = frame[frame["Month"].astype(str).str.strip() != ""]
+    kv_put("extra_revenue", frame.to_dict("records"))
+    return frame
+
+
+def extra_revenue_by_day(frame):
+    """Map each extra revenue row to the month and day it is collected."""
+    plan = {}
+    if frame is None or frame.empty:
+        return plan
+    for _, r in frame.iterrows():
+        try:
+            month = str(r["Month"]).strip()
+            amount = float(r["Expected amount"])
+            day = int(r["Day of month"])
+        except Exception:
+            continue
+        if amount:
+            plan[(month, max(1, min(day, 31)))] = (
+                plan.get((month, max(1, min(day, 31))), 0.0) + amount)
+    return plan
+
+
+def extra_revenue_totals(frame):
+    """Total per stream, so each line can be seen on its own."""
+    if frame is None or frame.empty:
+        return pd.DataFrame(columns=["Stream", "Total"])
+    out = frame.copy()
+    out["Expected amount"] = pd.to_numeric(out["Expected amount"],
+                                           errors="coerce").fillna(0.0)
+    return (out.groupby("Stream", as_index=False)["Expected amount"].sum()
+            .rename(columns={"Expected amount": "Total"})
+            .sort_values("Total", ascending=False))
+
+
 AGENT_COLUMNS = ["Month", "Agents", "Billable hours per agent",
                  "Average rate per hour"]
 
@@ -535,7 +586,8 @@ def is_last_day(d):
     return d.day == days_in_month(d)
 
 
-def build_schedule(s, horizon, severance=None, expenses=None, revenues=None):
+def build_schedule(s, horizon, severance=None, expenses=None, revenues=None,
+                   extra_revenue=None):
     """Day-by-day cash projection on either a cash or an accrual basis.
 
     Cash basis: money leaves on the day it actually leaves. Decimo hits on
@@ -591,6 +643,8 @@ def build_schedule(s, horizon, severance=None, expenses=None, revenues=None):
             except Exception:
                 continue
 
+    extra_plan = extra_revenue_by_day(extra_revenue)
+
     loc_limit = float(s.get("loc_limit", 0.0))
     loc_balance = float(s.get("loc_drawn", 0.0))
     loc_rate = float(s.get("loc_rate", 0.0)) / 100.0
@@ -615,6 +669,12 @@ def build_schedule(s, horizon, severance=None, expenses=None, revenues=None):
             collections = s["revenue"] / dim
         else:
             collections = s["revenue"] if d.day == min(s["revenue_day"], dim) else 0.0
+
+        # Software and anything else outside the core book lands on its own day.
+        other_revenue = extra_plan.get((label, d.day), 0.0)
+        if d.day == dim:
+            other_revenue += sum(v for (m, k), v in extra_plan.items()
+                                 if m == label and k > dim)
 
         pay = s["payroll"] / 2 if (d.day == 15 or is_last_day(d)) else 0.0
         css_out = s["css"] if is_last_day(d) else 0.0
@@ -651,7 +711,7 @@ def build_schedule(s, horizon, severance=None, expenses=None, revenues=None):
             draw += min(loc_draw_amount, available)
             available -= draw
 
-        projected = balance + collections - out + draw
+        projected = balance + collections + other_revenue - out + draw
         if loc_auto and available > 0 and projected < loc_min_cash:
             need = loc_min_cash - projected
             # Draw in round thousands, the way a bank transfer actually happens.
@@ -661,11 +721,12 @@ def build_schedule(s, horizon, severance=None, expenses=None, revenues=None):
             available -= extra
 
         loc_balance += draw
-        balance += collections - out + draw
+        balance += collections + other_revenue - out + draw
 
         rows.append({
             "Date": d,
             "Collections": collections,
+            "Other Revenue": other_revenue,
             "Credit Draw": draw,
             "Payroll": pay,
             "CSS / Government": css_out,
@@ -676,7 +737,7 @@ def build_schedule(s, horizon, severance=None, expenses=None, revenues=None):
             "Severance": sev_out,
             "Other Fixed": fixed_out,
             "Interest": interest,
-            "Net": collections + draw - out,
+            "Net": collections + other_revenue + draw - out,
             "Balance": balance,
             "Credit Balance": loc_balance,
             "Credit Available": max(loc_limit - loc_balance, 0.0),
@@ -688,7 +749,7 @@ def monthly_summary(df):
     """Roll the daily schedule up by calendar month."""
     out = df.copy()
     out["Month"] = pd.to_datetime(out["Date"]).dt.strftime("%Y-%m")
-    cols = ["Collections", "Credit Draw", "Payroll", "CSS / Government", "Pluxee",
+    cols = ["Collections", "Other Revenue", "Credit Draw", "Payroll", "CSS / Government", "Pluxee",
             "Viatico", "Decimo", "Provisions", "Severance", "Other Fixed",
             "Interest", "Net"]
     g = out.groupby("Month", as_index=False)[cols].sum()
@@ -874,7 +935,8 @@ if page == "Dashboard":
                                           int(saved.get("revenue_lag", 0)))
     else:
         dash_rev = load_revenue_schedule()
-    df = build_schedule(saved, days, sev, load_expense_schedule(), dash_rev)
+    df = build_schedule(saved, days, sev, load_expense_schedule(), dash_rev,
+                        load_extra_revenue())
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Cash on hand", MONEY.format(saved["start_cash"]))
     c2.metric("Balance in 30 days", MONEY.format(df["Balance"].iloc[min(29, days - 1)]))
@@ -1865,6 +1927,35 @@ elif page == "Cash Flow":
                 },
             )
 
+        with st.expander("Other revenue lines, such as software"):
+            st.caption(
+                "Revenue outside the core book, month by month. Software sales "
+                "carry no extra payroll, so every dollar here flows to cash. "
+                "The Stream column names the line, so you can run two or three "
+                "of them side by side. These are always included, whatever the "
+                "collections timing above is set to."
+            )
+            saved_extra = load_extra_revenue()
+            if saved_extra.empty:
+                months_e = months_between(date.today(), default_end)
+                saved_extra = pd.DataFrame(
+                    [{"Stream": "Software", "Month": m, "Expected amount": 0.0,
+                      "Day of month": 20} for m in months_e]
+                    + [{"Stream": "Other new revenue", "Month": m,
+                        "Expected amount": 0.0, "Day of month": 20}
+                       for m in months_e]
+                )
+            extra_rows = st.data_editor(
+                saved_extra, num_rows="dynamic", use_container_width=True,
+                hide_index=True, key="extra_editor",
+                column_config={
+                    "Expected amount": st.column_config.NumberColumn(
+                        min_value=0.0, step=1000.0, format="$%.2f"),
+                    "Day of month": st.column_config.NumberColumn(
+                        min_value=1, max_value=31, step=1),
+                },
+            )
+
         with st.expander("Collections month by month"):
             st.caption(
                 "Revenue that changes every month goes here. Fill in what you "
@@ -1927,6 +2018,7 @@ elif page == "Cash Flow":
         save_expense_schedule(pd.DataFrame(expense_rows))
         save_revenue_schedule(pd.DataFrame(revenue_rows))
         save_agent_schedule(pd.DataFrame(agent_rows))
+        save_extra_revenue(pd.DataFrame(extra_rows))
         st.success("Saved. These numbers will load automatically next time.")
 
     if calculate or store:
@@ -1935,6 +2027,7 @@ elif page == "Cash Flow":
         exp_frame = pd.DataFrame(expense_rows)
         rev_frame = pd.DataFrame(revenue_rows)
         agent_frame = pd.DataFrame(agent_rows)
+        extra_frame = pd.DataFrame(extra_rows)
         if current["revenue_mode"] == "Build from agent hours":
             rev_frame = agent_revenue_schedule(
                 agent_frame, int(revenue_day), int(revenue_lag))
@@ -1965,10 +2058,11 @@ elif page == "Cash Flow":
                  "Accrual basis charges monthly provisions instead.")
         current = dict(current, basis=basis)
 
-        df = build_schedule(current, days, sev, exp_frame, rev_frame)
+        df = build_schedule(current, days, sev, exp_frame, rev_frame,
+                            extra_frame)
         other = build_schedule(dict(current, basis=(
             "Accrual basis" if basis == "Cash basis" else "Cash basis")),
-            days, sev, exp_frame, rev_frame)
+            days, sev, exp_frame, rev_frame, extra_frame)
         st.caption(
             f"Ending balance on this basis: {MONEY.format(df['Balance'].iloc[-1])}. "
             f"On the other basis it would be "
@@ -1983,6 +2077,17 @@ elif page == "Cash Flow":
         low = df.loc[df["Balance"].idxmin()]
         m3.metric(f"Lowest balance ({days}d)", MONEY.format(low["Balance"]),
                   str(low["Date"]))
+
+        extra_total = df["Other Revenue"].sum()
+        if extra_total:
+            st.subheader("Other revenue lines")
+            by_stream = extra_revenue_totals(extra_frame)
+            money_table(by_stream)
+            st.caption(
+                MONEY.format(extra_total) + " of revenue outside the core book "
+                "lands inside this window, carried in its own column so you can "
+                "see the core business on its own."
+            )
 
         collections_total = df["Collections"].sum()
         payments = int((df["Collections"] > 0).sum()) if current["revenue_mode"] != "Spread evenly" else 0
