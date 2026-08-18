@@ -157,9 +157,7 @@ elif page == "Payroll":
         money_table(groups)
 
         st.subheader("Loan and deduction programs")
-        st.caption(
-            "These come out of employee pay and are not company operating expenses."
-        )
+        st.caption("These come out of employee pay and are not company operating expenses.")
         loans = loan_detail(df)
         if loans.empty:
             st.write("No loan deductions in this period.")
@@ -182,9 +180,7 @@ elif page == "Payroll":
 
         st.divider()
         st.subheader("Send to Cash Flow")
-        st.caption(
-            "This period is one quincena, so the monthly figures are double these amounts."
-        )
+        st.caption("This period is one quincena, so the monthly figures are double these amounts.")
         monthly_payroll = s["net"] * 2
         monthly_css = (s["employer_cost"] + s["employee_statutory"]) * 2
         i, j = st.columns(2)
@@ -273,7 +269,8 @@ elif page == "Cash Flow":
         st.line_chart(df.set_index("Date")["Balance"])
 
         view = st.radio("Detail view", ["30 days", "90 days"], horizontal=True)
-        table = d30 if view == "30 days" else df
+        table = d30 if view == "90 days" else d30
+        table = (df if view == "90 days" else d30)
         table = table[table["Net"] != 0]
         st.dataframe(
             table.style.format({c: MONEY for c in table.columns if c != "Date"}),
