@@ -1397,16 +1397,94 @@ elif page == "Sage Actuals":
                                               "Total"]]
                                     .sort_values("Selected Total", ascending=False))
 
-                if st.button("Use this as my other fixed expenses"):
+                st.markdown("**Adjust each line to what you expect going forward**")
+                st.caption(
+                    "History is not always the plan. A cost that ran at sixty "
+                    "thousand a month and has since been cancelled would drag "
+                    "the average up forever, so override it here. The Sage "
+                    "average is shown beside your figure, and the day of month "
+                    "is when that money actually leaves the bank. Your edits "
+                    "are remembered."
+                )
+                saved_overrides = kv_get("line_overrides") or {}
+                plan = pd.DataFrame({
+                    "Line": other["Label"].values,
+                    "Sage monthly average": (other["Selected Total"].values / months
+                                             if months else other["Selected Total"].values),
+                })
+                plan["Use this amount"] = [
+                    float(saved_overrides.get(l, {}).get("amount", a))
+                    for l, a in zip(plan["Line"], plan["Sage monthly average"])
+                ]
+                plan["Day of month"] = [
+                    int(saved_overrides.get(l, {}).get("day", 15))
+                    for l in plan["Line"]
+                ]
+                plan = plan.sort_values("Sage monthly average", ascending=False)
+                edited = st.data_editor(
+                    plan, use_container_width=True, hide_index=True,
+                    disabled=["Line", "Sage monthly average"],
+                    column_config={
+                        "Sage monthly average": st.column_config.NumberColumn(
+                            format="$%.2f"),
+                        "Use this amount": st.column_config.NumberColumn(
+                            format="$%.2f", min_value=0.0),
+                        "Day of month": st.column_config.NumberColumn(
+                            min_value=1, max_value=31, step=1),
+                    },
+                    key="line_plan",
+                )
+
+                planned_total = float(pd.to_numeric(
+                    edited["Use this amount"], errors="coerce").fillna(0).sum())
+                average_total = float(pd.to_numeric(
+                    edited["Sage monthly average"], errors="coerce").fillna(0).sum())
+                p1, p2 = st.columns(2)
+                p1.metric("Planned monthly total", MONEY.format(planned_total))
+                p2.metric("Difference from the Sage average",
+                          MONEY.format(planned_total - average_total))
+
+                def remember_lines():
+                    kv_put("excluded_lines", excluded)
+                    kv_put("line_overrides", {
+                        str(r["Line"]): {"amount": float(r["Use this amount"] or 0),
+                                         "day": int(r["Day of month"] or 15)}
+                        for _, r in edited.iterrows()
+                    })
+
+                u1, u2 = st.columns(2)
+                if u1.button("Use the Sage average as my other fixed expenses"):
                     saved = load_settings()
                     saved["fixed"] = round(monthly_other, 2)
                     save_settings(saved)
-                    kv_put("excluded_lines", excluded)
+                    remember_lines()
                     st.success(
                         "Cash Flow other fixed expenses set to "
                         + MONEY.format(monthly_other) + " per month, with "
                         + MONEY.format(monthly_left_out)
                         + " a month left out as already covered by payroll."
+                    )
+                if u2.button("Use my adjusted figures and their due days"):
+                    saved = load_settings()
+                    saved["fixed"] = round(planned_total, 2)
+                    saved["expense_mode"] = "Use my due-date schedule"
+                    save_settings(saved)
+                    remember_lines()
+                    rows = pd.DataFrame({
+                        "Expense": edited["Line"],
+                        "Monthly amount": pd.to_numeric(
+                            edited["Use this amount"], errors="coerce").fillna(0.0),
+                        "Day of month": pd.to_numeric(
+                            edited["Day of month"], errors="coerce").fillna(15).astype(int),
+                    })
+                    rows = rows[rows["Monthly amount"] > 0]
+                    save_expense_schedule(rows)
+                    st.success(
+                        "Cash Flow set to your adjusted figures, "
+                        + MONEY.format(planned_total)
+                        + f" a month across {len(rows)} lines, each on the day you "
+                        "chose. Cash Flow timing was switched to the due-date "
+                        "schedule."
                     )
 
                 st.download_button(
