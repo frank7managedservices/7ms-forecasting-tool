@@ -28,6 +28,220 @@ DEFAULTS = {
 MONEY = "${:,.2f}"
 
 # ---------------------------------------------------------------------------
+# Persistent storage.
+# Streamlit's own disk is wiped on every restart, so anything worth keeping
+# goes to a Postgres database. The connection string comes from the
+# DATABASE_URL secret and never appears in this repository. If no secret is
+# set the app silently falls back to local JSON files, exactly as before, so
+# it still runs for anyone without a database.
+# ---------------------------------------------------------------------------
+
+import io
+import os
+
+from sqlalchemy import create_engine, text
+
+
+def db_url():
+    try:
+        if "DATABASE_URL" in st.secrets:
+            return str(st.secrets["DATABASE_URL"]).strip()
+    except Exception:
+        pass
+    return (os.environ.get("DATABASE_URL") or "").strip()
+
+
+@st.cache_resource(show_spinner=False)
+def get_engine(url):
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql://", 1)
+    engine = create_engine(url, pool_pre_ping=True, pool_recycle=280)
+    with engine.begin() as conn:
+        conn.execute(text(
+            "CREATE TABLE IF NOT EXISTS app_settings ("
+            " name VARCHAR(120) PRIMARY KEY,"
+            " body TEXT NOT NULL,"
+            " saved_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+        ))
+        conn.execute(text(
+            "CREATE TABLE IF NOT EXISTS app_documents ("
+            " kind VARCHAR(40) NOT NULL,"
+            " name VARCHAR(200) NOT NULL,"
+            " body TEXT NOT NULL,"
+            " notes TEXT,"
+            " saved_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,"
+            " PRIMARY KEY (kind, name))"
+        ))
+    return engine
+
+
+def db():
+    """Return a live engine, or None if storage is not configured."""
+    url = db_url()
+    if not url:
+        return None
+    try:
+        return get_engine(url)
+    except Exception as exc:
+        st.session_state["db_error"] = str(exc)
+        return None
+
+
+def db_ready():
+    return db() is not None
+
+
+def kv_put(name, obj):
+    engine = db()
+    if engine is None:
+        return False
+    body = json.dumps(obj, default=str)
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM app_settings WHERE name = :n"), {"n": name})
+        conn.execute(
+            text("INSERT INTO app_settings (name, body) VALUES (:n, :b)"),
+            {"n": name, "b": body},
+        )
+    return True
+
+
+def kv_get(name, default=None):
+    engine = db()
+    if engine is None:
+        return default
+    try:
+        with engine.begin() as conn:
+            row = conn.execute(
+                text("SELECT body FROM app_settings WHERE name = :n"), {"n": name}
+            ).fetchone()
+    except Exception:
+        return default
+    if row is None:
+        return default
+    try:
+        return json.loads(row[0])
+    except Exception:
+        return default
+
+
+def doc_put(kind, name, frame, notes=""):
+    """Save a dataframe under a name you can pick from a list later."""
+    engine = db()
+    if engine is None:
+        return False
+    body = frame.to_csv(index=False)
+    with engine.begin() as conn:
+        conn.execute(
+            text("DELETE FROM app_documents WHERE kind = :k AND name = :n"),
+            {"k": kind, "n": name},
+        )
+        conn.execute(
+            text("INSERT INTO app_documents (kind, name, body, notes)"
+                 " VALUES (:k, :n, :b, :o)"),
+            {"k": kind, "n": name, "b": body, "o": notes},
+        )
+    return True
+
+
+def doc_list(kind):
+    engine = db()
+    if engine is None:
+        return []
+    try:
+        with engine.begin() as conn:
+            rows = conn.execute(
+                text("SELECT name, notes, saved_at, LENGTH(body) FROM app_documents"
+                     " WHERE kind = :k ORDER BY name"),
+                {"k": kind},
+            ).fetchall()
+    except Exception:
+        return []
+    return [{"name": r[0], "notes": r[1] or "", "saved_at": r[2], "size": r[3]}
+            for r in rows]
+
+
+def doc_get(kind, name, dates=None):
+    engine = db()
+    if engine is None:
+        return None
+    with engine.begin() as conn:
+        row = conn.execute(
+            text("SELECT body FROM app_documents WHERE kind = :k AND name = :n"),
+            {"k": kind, "n": name},
+        ).fetchone()
+    if row is None:
+        return None
+    return pd.read_csv(io.StringIO(row[0]), parse_dates=dates or [])
+
+
+def doc_delete(kind, name):
+    engine = db()
+    if engine is None:
+        return False
+    with engine.begin() as conn:
+        conn.execute(
+            text("DELETE FROM app_documents WHERE kind = :k AND name = :n"),
+            {"k": kind, "n": name},
+        )
+    return True
+
+
+def raw_put(kind, name, body, notes=""):
+    engine = db()
+    if engine is None:
+        return False
+    with engine.begin() as conn:
+        conn.execute(
+            text("DELETE FROM app_documents WHERE kind = :k AND name = :n"),
+            {"k": kind, "n": name},
+        )
+        conn.execute(
+            text("INSERT INTO app_documents (kind, name, body, notes)"
+                 " VALUES (:k, :n, :b, :o)"),
+            {"k": kind, "n": name, "b": body, "o": notes},
+        )
+    return True
+
+
+def raw_get(kind, name):
+    engine = db()
+    if engine is None:
+        return None
+    with engine.begin() as conn:
+        row = conn.execute(
+            text("SELECT body FROM app_documents WHERE kind = :k AND name = :n"),
+            {"k": kind, "n": name},
+        ).fetchone()
+    return None if row is None else row[0]
+
+
+def sheet_text(file, name):
+    """Turn an uploaded sheet into plain CSV text we can store and re-parse."""
+    return _read_any(file, name).to_csv(index=False, header=False)
+
+
+def stored_picker(kind, label, help_text):
+    """Return (choice, names) for a saved-document selector."""
+    rows = doc_list(kind)
+    names = [r["name"] for r in rows]
+    if not names:
+        st.caption(help_text)
+        return "Upload a new file", rows
+    return st.selectbox(label, ["Upload a new file"] + names,
+                        key=f"pick_{kind}"), rows
+
+
+def storage_note():
+    """One line in the sidebar so you always know where data is going."""
+    if db_ready():
+        st.sidebar.success("Saved data: database")
+    else:
+        st.sidebar.warning("Saved data: this session only")
+        if st.session_state.get("db_error"):
+            st.sidebar.caption("Database not reachable. Using temporary files.")
+
+
+# ---------------------------------------------------------------------------
 # Panama liquidacion (severance), per the Codigo de Trabajo de Panama:
 #   Weekly salary = monthly x 12 / 52.   Daily salary = monthly / 30.
 #   Prima de antiguedad (Art. 224): 1 week of salary per year of service, owed
@@ -134,6 +348,9 @@ def estimate(monthly, hire, term, reason, decimo_since=None,
 
 
 def load_terminations():
+    stored = kv_get("terminations")
+    if isinstance(stored, list):
+        return stored
     if TERMINATIONS_FILE.exists():
         try:
             return json.loads(TERMINATIONS_FILE.read_text())
@@ -143,7 +360,8 @@ def load_terminations():
 
 
 def save_terminations(records):
-    TERMINATIONS_FILE.write_text(json.dumps(records, indent=2, default=str))
+    if not kv_put("terminations", records):
+        TERMINATIONS_FILE.write_text(json.dumps(records, indent=2, default=str))
 
 
 def add_termination(record):
@@ -168,6 +386,9 @@ def scheduled_payments(records):
 
 
 def load_settings():
+    stored = kv_get("cash_settings")
+    if isinstance(stored, dict):
+        return {**DEFAULTS, **stored}
     if SETTINGS_FILE.exists():
         try:
             return {**DEFAULTS, **json.loads(SETTINGS_FILE.read_text())}
@@ -177,7 +398,8 @@ def load_settings():
 
 
 def save_settings(values):
-    SETTINGS_FILE.write_text(json.dumps(values, indent=2))
+    if not kv_put("cash_settings", values):
+        SETTINGS_FILE.write_text(json.dumps(values, indent=2))
 
 
 def days_in_month(d):
@@ -385,6 +607,8 @@ page = st.sidebar.radio(
      "Cash Flow", "AI Assistant"],
 )
 
+storage_note()
+
 st.title(page)
 
 if page == "Dashboard":
@@ -420,94 +644,138 @@ elif page == "Payroll":
         "the final day of the month; CSS and government amounts are due at month end in arrears."
     )
 
-    upload = st.file_uploader("DV Pre-Planilla file", type=["xlsx", "xls", "csv"])
+    stored = doc_list("payroll")
+    df, meta = None, {}
 
-    if upload is None:
-        st.info("Choose a file to see headcount, pay, and employer cost by employee group.")
+    if stored:
+        names = [r["name"] for r in stored]
+        choice = st.selectbox("Saved payroll periods", ["Upload a new file"] + names)
     else:
+        choice = "Upload a new file"
+        st.caption("No periods saved yet. Upload a file and you can save it below.")
+
+    if choice == "Upload a new file":
+        upload = st.file_uploader("DV Pre-Planilla file", type=["xlsx", "xls", "csv"])
+        if upload is None:
+            st.info(
+                "Choose a file to see headcount, pay, and employer cost by employee "
+                "group. Once a period is saved you can reopen it without uploading."
+            )
+            st.stop()
         try:
             df, meta = read_payroll(upload, upload.name)
         except Exception as exc:
             st.error(f"Could not read that file: {exc}")
             st.stop()
+        st.session_state["payroll_new"] = True
+    else:
+        df = doc_get("payroll", choice)
+        if df is None:
+            st.error("That saved period could not be read.")
+            st.stop()
+        row = next((r for r in stored if r["name"] == choice), {})
+        try:
+            meta = json.loads(row.get("notes") or "{}")
+        except Exception:
+            meta = {}
+        st.success(f"Loaded saved period: {choice}")
+        st.session_state["payroll_new"] = False
 
-        if meta.get("Detalle"):
-            st.caption(f"Period: {meta['Detalle']}")
-        if meta.get("CompaNia"):
-            st.caption(f"Company: {meta['CompaNia']}  ·  Planilla: {meta.get('Planilla', '')}")
+    if meta.get("Detalle"):
+        st.caption(f"Period: {meta['Detalle']}")
+    if meta.get("CompaNia"):
+        st.caption(f"Company: {meta['CompaNia']}  ·  Planilla: {meta.get('Planilla', '')}")
 
-        s = summarize(df)
+    s = summarize(df)
 
-        a, b, c, d = st.columns(4)
-        a.metric("Active employees", f"{s['headcount']:,}")
-        b.metric("Gross pay", MONEY.format(s["gross"]))
-        c.metric("Net pay (cash to staff)", MONEY.format(s["net"]))
-        d.metric("Employer cost", MONEY.format(s["employer_cost"]))
+    a, b, c, d = st.columns(4)
+    a.metric("Active employees", f"{s['headcount']:,}")
+    b.metric("Gross pay", MONEY.format(s["gross"]))
+    c.metric("Net pay (cash to staff)", MONEY.format(s["net"]))
+    d.metric("Employer cost", MONEY.format(s["employer_cost"]))
 
-        e, f, g, h = st.columns(4)
-        e.metric("Total deductions", MONEY.format(s["deductions"]))
-        f.metric("Employee statutory withheld", MONEY.format(s["employee_statutory"]))
-        g.metric("Overtime", MONEY.format(s["overtime"]))
-        h.metric("Viatico (non-taxable)", MONEY.format(s["viatico"]))
+    e, f, g, h = st.columns(4)
+    e.metric("Total deductions", MONEY.format(s["deductions"]))
+    f.metric("Employee statutory withheld", MONEY.format(s["employee_statutory"]))
+    g.metric("Overtime", MONEY.format(s["overtime"]))
+    h.metric("Viatico (non-taxable)", MONEY.format(s["viatico"]))
 
-        k, m, n, o = st.columns(4)
-        k.metric("Decimo paid (cash)", MONEY.format(s["decimo_paid"]))
-        m.metric("Decimo accrued (not cash)", MONEY.format(s["decimo_accrued"]))
-        n.metric("Vacation paid", MONEY.format(s["vacation"]))
-        o.metric("Pass-through loans", MONEY.format(s["loans"]))
+    k, m, n, o = st.columns(4)
+    k.metric("Decimo paid (cash)", MONEY.format(s["decimo_paid"]))
+    m.metric("Decimo accrued (not cash)", MONEY.format(s["decimo_accrued"]))
+    n.metric("Vacation paid", MONEY.format(s["vacation"]))
+    o.metric("Pass-through loans", MONEY.format(s["loans"]))
 
-        if s["decimo_paid"] > 0:
-            st.warning(
-                "This period includes decimo (13th month) of "
-                f"{MONEY.format(s['decimo_paid'])}. Decimo is paid on 15 April, "
-                "15 August, and 15 December, so it is excluded from the recurring "
-                "payroll figure below and tracked as its own cash line."
-            )
-
-        st.subheader("By employee group")
-        groups = by_group(df)
-        money_table(groups)
-
-        st.subheader("Loan and deduction programs")
-        st.caption(
-            "These come out of employee pay and are not company operating expenses."
-        )
-        loans = loan_detail(df)
-        if loans.empty:
-            st.write("No loan deductions in this period.")
-        else:
-            money_table(loans)
-            st.metric("Total pass-through deductions", MONEY.format(s["loans"]))
-
-        with st.expander("Employee detail"):
-            cols = [c for c in ["NOMBRE", "CARGO", "GRUPO", "SALARIO_MENSUAL",
-                                "INGRESO_BRUTO", "TOTAL_RETENCIONES", "INGRESO_NETO",
-                                "TOTAL_GASTO_PAT", "TIPO_PAGO"] if c in df.columns]
-            st.dataframe(df[cols], use_container_width=True, hide_index=True)
-
-        st.download_button(
-            "Download group summary (CSV)",
-            data=groups.to_csv(index=False),
-            file_name="payroll-by-group.csv",
-            mime="text/csv",
+    if s["decimo_paid"] > 0:
+        st.warning(
+            "This period includes decimo (13th month) of "
+            f"{MONEY.format(s['decimo_paid'])}. Decimo is paid on 15 April, "
+            "15 August, and 15 December, so it is excluded from the recurring "
+            "payroll figure below and tracked as its own cash line."
         )
 
-        st.divider()
-        st.subheader("Send to Cash Flow")
-        st.caption(
-            "This period is one quincena, so the monthly figures are double these amounts."
+    st.subheader("By employee group")
+    groups = by_group(df)
+    money_table(groups)
+
+    st.subheader("Loan and deduction programs")
+    st.caption(
+        "These come out of employee pay and are not company operating expenses."
+    )
+    loans = loan_detail(df)
+    if loans.empty:
+        st.write("No loan deductions in this period.")
+    else:
+        money_table(loans)
+        st.metric("Total pass-through deductions", MONEY.format(s["loans"]))
+
+    with st.expander("Employee detail"):
+        cols = [c for c in ["NOMBRE", "CARGO", "GRUPO", "SALARIO_MENSUAL",
+                            "INGRESO_BRUTO", "TOTAL_RETENCIONES", "INGRESO_NETO",
+                            "TOTAL_GASTO_PAT", "TIPO_PAGO"] if c in df.columns]
+        st.dataframe(df[cols], use_container_width=True, hide_index=True)
+
+    st.download_button(
+        "Download group summary (CSV)",
+        data=groups.to_csv(index=False),
+        file_name="payroll-by-group.csv",
+        mime="text/csv",
+    )
+
+    st.divider()
+    st.subheader("Send to Cash Flow")
+    st.caption(
+        "This period is one quincena, so the monthly figures are double these amounts."
+    )
+    monthly_payroll = s["net"] * 2
+    monthly_css = (s["employer_cost"] + s["employee_statutory"]) * 2
+    i, j = st.columns(2)
+    i.metric("Monthly payroll cash", MONEY.format(monthly_payroll))
+    j.metric("Monthly CSS / government", MONEY.format(monthly_css))
+    if st.button("Update my Cash Flow numbers"):
+        saved = load_settings()
+        saved["payroll"] = round(monthly_payroll, 2)
+        saved["css"] = round(monthly_css, 2)
+        save_settings(saved)
+        st.success("Cash Flow updated. Open the Cash Flow page to see the effect.")
+
+    st.divider()
+    st.subheader("Save this period")
+    if db_ready():
+        default_name = str(meta.get("Detalle") or "period").strip()[:120]
+        label = st.text_input("Name for this period", value=default_name)
+        s1, s2 = st.columns(2)
+        if s1.button("Save to database"):
+            if doc_put("payroll", label, df, notes=json.dumps(meta, default=str)):
+                st.success(f"Saved as {label}. Pick it from the list next time.")
+        if choice != "Upload a new file" and s2.button("Delete this saved period"):
+            doc_delete("payroll", choice)
+            st.success("Deleted. Refresh the page.")
+    else:
+        st.warning(
+            "No database configured, so periods cannot be saved yet. Add a "
+            "DATABASE_URL secret in the app settings."
         )
-        monthly_payroll = s["net"] * 2
-        monthly_css = (s["employer_cost"] + s["employee_statutory"]) * 2
-        i, j = st.columns(2)
-        i.metric("Monthly payroll cash", MONEY.format(monthly_payroll))
-        j.metric("Monthly CSS / government", MONEY.format(monthly_css))
-        if st.button("Update my Cash Flow numbers"):
-            saved = load_settings()
-            saved["payroll"] = round(monthly_payroll, 2)
-            saved["css"] = round(monthly_css, 2)
-            save_settings(saved)
-            st.success("Cash Flow updated. Open the Cash Flow page to see the effect.")
 
 elif page == "Terminations":
     st.write(
@@ -652,198 +920,268 @@ elif page == "Sage Actuals":
     tab_is, tab_gl = st.tabs(["Income Statement", "General Ledger"])
 
     with tab_is:
-        up = st.file_uploader("12-month income statement", type=["xlsx", "xls", "csv"],
-                             key="is_upload")
-        if up is None:
+        choice_is, rows_is = stored_picker(
+            "sage_is", "Saved income statements",
+            "No income statements saved yet. Upload one and you can save it below.")
+
+        body_is, source_name = None, ""
+        if choice_is == "Upload a new file":
+            up = st.file_uploader("12-month income statement",
+                                  type=["xlsx", "xls", "csv"], key="is_upload")
+            if up is not None:
+                body_is = sheet_text(up, up.name)
+                source_name = Path(up.name).stem
+        else:
+            body_is = raw_get("sage_is", choice_is)
+            source_name = choice_is
+            if body_is is not None:
+                st.success(f"Loaded saved statement: {choice_is}")
+
+        if body_is is None:
             st.info("Upload the income statement to see actuals by period.")
         else:
             try:
-                lines, totals, periods = read_income_statement(up, up.name)
+                lines, totals, periods = read_income_statement(
+                    io.StringIO(body_is), "saved.csv")
             except Exception as exc:
                 st.error(f"Could not read that file: {exc}")
-                st.stop()
-
-            st.subheader("Periods to average")
-            st.caption(
-                "Totals and tables below always show every period. This range only "
-                "controls the monthly averages and what gets sent to Cash Flow, so "
-                "you can leave out empty months and one-off cleanup months."
-            )
-            r1, r2 = st.columns(2)
-            first = r1.selectbox("From", periods, index=0)
-            last = r2.selectbox("To", periods, index=len(periods) - 1)
-            i_first, i_last = periods.index(first), periods.index(last)
-            if i_first > i_last:
-                i_first, i_last = i_last, i_first
-            avg_periods = periods[i_first:i_last + 1]
-            st.caption(f"Averaging over {len(avg_periods)} period(s): "
-                       f"{avg_periods[0]} through {avg_periods[-1]}")
-
-            summary = income_summary(totals, periods)
-            avg_summary = income_summary(totals, avg_periods)
-            a, b, c, d = st.columns(4)
-            a.metric("Total revenue", MONEY.format(summary["Total Revenues"]))
-            b.metric("Cost of sales", MONEY.format(summary["Total Cost of Sales"]))
-            c.metric("Operating expenses", MONEY.format(summary["Total Expenses"]))
-            d.metric("Net income", MONEY.format(summary["Net Income"]))
-
-            months = len(avg_periods)
-            e, f, g, h = st.columns(4)
-            e.metric("Gross profit", MONEY.format(summary["Gross Profit"]))
-            margin = (summary["Gross Profit"] / summary["Total Revenues"] * 100
-                      if summary["Total Revenues"] else 0.0)
-            f.metric("Gross margin", f"{margin:.1f}%")
-            g.metric("Average monthly revenue",
-                     MONEY.format(avg_summary["Total Revenues"] / months if months else 0))
-            h.metric("Average monthly net income",
-                     MONEY.format(avg_summary["Net Income"] / months if months else 0))
-            st.caption(
-                "The first two figures cover the full statement. The two averages "
-                f"cover {avg_periods[0]} through {avg_periods[-1]} only."
-            )
-
-            if summary["Net Income"] < 0:
-                st.error(
-                    "Net loss for the period of "
-                    + MONEY.format(abs(summary["Net Income"]))
-                )
+                periods = []
+            if not periods:
+                st.warning("No periods found in that file.")
             else:
-                st.success("Net profit for the period.")
 
-            series = monthly_series(totals, periods)
+                st.subheader("Periods to average")
+                st.caption(
+                    "Totals and tables below always show every period. This range only "
+                    "controls the monthly averages and what gets sent to Cash Flow, so "
+                    "you can leave out empty months and one-off cleanup months."
+                )
+                r1, r2 = st.columns(2)
+                first = r1.selectbox("From", periods, index=0)
+                last = r2.selectbox("To", periods, index=len(periods) - 1)
+                i_first, i_last = periods.index(first), periods.index(last)
+                if i_first > i_last:
+                    i_first, i_last = i_last, i_first
+                avg_periods = periods[i_first:i_last + 1]
+                st.caption(f"Averaging over {len(avg_periods)} period(s): "
+                           f"{avg_periods[0]} through {avg_periods[-1]}")
 
-            st.subheader("Revenue vs cost by period")
-            st.bar_chart(series.set_index("Period")[["Revenue", "Cost of Sales",
-                                                     "Expenses"]])
+                summary = income_summary(totals, periods)
+                avg_summary = income_summary(totals, avg_periods)
+                a, b, c, d = st.columns(4)
+                a.metric("Total revenue", MONEY.format(summary["Total Revenues"]))
+                b.metric("Cost of sales", MONEY.format(summary["Total Cost of Sales"]))
+                c.metric("Operating expenses", MONEY.format(summary["Total Expenses"]))
+                d.metric("Net income", MONEY.format(summary["Net Income"]))
 
-            st.subheader("Net income by period")
-            st.bar_chart(series.set_index("Period")["Net Income"])
+                months = len(avg_periods)
+                e, f, g, h = st.columns(4)
+                e.metric("Gross profit", MONEY.format(summary["Gross Profit"]))
+                margin = (summary["Gross Profit"] / summary["Total Revenues"] * 100
+                          if summary["Total Revenues"] else 0.0)
+                f.metric("Gross margin", f"{margin:.1f}%")
+                g.metric("Average monthly revenue",
+                         MONEY.format(avg_summary["Total Revenues"] / months if months else 0))
+                h.metric("Average monthly net income",
+                         MONEY.format(avg_summary["Net Income"] / months if months else 0))
+                st.caption(
+                    "The first two figures cover the full statement. The two averages "
+                    f"cover {avg_periods[0]} through {avg_periods[-1]} only."
+                )
 
-            st.subheader("Totals by period")
-            money_table(series)
+                if summary["Net Income"] < 0:
+                    st.error(
+                        "Net loss for the period of "
+                        + MONEY.format(abs(summary["Net Income"]))
+                    )
+                else:
+                    st.success("Net profit for the period.")
 
-            st.subheader("Line detail")
-            section = st.radio("Section", ["Cost of Sales", "Expenses", "Revenues"],
-                               horizontal=True)
-            part = lines[lines["Section"] == section].copy()
-            part = part[["Line", "Total"] + periods].sort_values("Total",
-                                                                 ascending=False)
-            money_table(part)
+                series = monthly_series(totals, periods)
 
-            biggest = part.head(10)[["Line", "Total"]].set_index("Line")
-            st.subheader(f"Largest {section.lower()} lines")
-            st.bar_chart(biggest)
+                st.subheader("Revenue vs cost by period")
+                st.bar_chart(series.set_index("Period")[["Revenue", "Cost of Sales",
+                                                         "Expenses"]])
 
-            st.divider()
-            st.subheader("Send to Cash Flow")
-            st.caption(
-                "Non-payroll cost lines averaged over the periods you selected "
-                "above. Payroll, CSS, viatico, and decimo are already tracked "
-                "separately from the planilla, so they are left out of this figure."
-            )
-            payroll_words = ["salario", "salary", "xiii", "vacacion", "seguro social",
-                             "seguro educativo", "riesgos", "indemniza",
-                             "prima de antiguedad", "preaviso", "viatico", "wages",
-                             "payroll tax"]
-            other = lines[
-                lines["Section"].isin(["Cost of Sales", "Expenses"])
-                & ~lines["Line"].str.lower().str.contains("|".join(payroll_words))
-            ]
-            other = other.copy()
-            other["Selected Total"] = other[avg_periods].sum(axis=1)
-            monthly_other = (other["Selected Total"].sum() / months
-                             if months else 0.0)
-            o1, o2 = st.columns(2)
-            o1.metric("Average monthly other fixed expenses",
-                      MONEY.format(monthly_other))
-            o2.metric(f"Total across {months} period(s)",
-                      MONEY.format(other["Selected Total"].sum()))
-            with st.expander("Which lines are included"):
-                money_table(other[["Section", "Line", "Selected Total", "Total"]]
-                            .sort_values("Selected Total", ascending=False))
-            if st.button("Use this as my other fixed expenses"):
-                saved = load_settings()
-                saved["fixed"] = round(monthly_other, 2)
-                save_settings(saved)
-                st.success("Cash Flow updated. Open the Cash Flow page to see it.")
+                st.subheader("Net income by period")
+                st.bar_chart(series.set_index("Period")["Net Income"])
 
-            st.download_button(
-                "Download line detail (CSV)",
-                data=lines.to_csv(index=False),
-                file_name="sage-income-lines.csv",
-                mime="text/csv",
-            )
+                st.subheader("Totals by period")
+                money_table(series)
+
+                st.subheader("Line detail")
+                section = st.radio("Section", ["Cost of Sales", "Expenses", "Revenues"],
+                                   horizontal=True)
+                part = lines[lines["Section"] == section].copy()
+                part = part[["Line", "Total"] + periods].sort_values("Total",
+                                                                     ascending=False)
+                money_table(part)
+
+                biggest = part.head(10)[["Line", "Total"]].set_index("Line")
+                st.subheader(f"Largest {section.lower()} lines")
+                st.bar_chart(biggest)
+
+                st.divider()
+                st.subheader("Send to Cash Flow")
+                st.caption(
+                    "Non-payroll cost lines averaged over the periods you selected "
+                    "above. Payroll, CSS, viatico, and decimo are already tracked "
+                    "separately from the planilla, so they are left out of this figure."
+                )
+                payroll_words = ["salario", "salary", "xiii", "vacacion", "seguro social",
+                                 "seguro educativo", "riesgos", "indemniza",
+                                 "prima de antiguedad", "preaviso", "viatico", "wages",
+                                 "payroll tax"]
+                other = lines[
+                    lines["Section"].isin(["Cost of Sales", "Expenses"])
+                    & ~lines["Line"].str.lower().str.contains("|".join(payroll_words))
+                ]
+                other = other.copy()
+                other["Selected Total"] = other[avg_periods].sum(axis=1)
+                monthly_other = (other["Selected Total"].sum() / months
+                                 if months else 0.0)
+                o1, o2 = st.columns(2)
+                o1.metric("Average monthly other fixed expenses",
+                          MONEY.format(monthly_other))
+                o2.metric(f"Total across {months} period(s)",
+                          MONEY.format(other["Selected Total"].sum()))
+                with st.expander("Which lines are included"):
+                    money_table(other[["Section", "Line", "Selected Total", "Total"]]
+                                .sort_values("Selected Total", ascending=False))
+                if st.button("Use this as my other fixed expenses"):
+                    saved = load_settings()
+                    saved["fixed"] = round(monthly_other, 2)
+                    save_settings(saved)
+                    st.success("Cash Flow updated. Open the Cash Flow page to see it.")
+
+                st.download_button(
+                    "Download line detail (CSV)",
+                    data=lines.to_csv(index=False),
+                    file_name="sage-income-lines.csv",
+                    mime="text/csv",
+                )
+
+                st.divider()
+                st.subheader("Save this statement")
+                if db_ready():
+                    name_is = st.text_input("Name for this statement",
+                                            value=source_name or "income statement",
+                                            key="name_is")
+                    b1, b2 = st.columns(2)
+                    if b1.button("Save to database", key="save_is"):
+                        raw_put("sage_is", name_is, body_is,
+                                notes=f"{len(periods)} periods")
+                        st.success(f"Saved as {name_is}.")
+                    if choice_is != "Upload a new file" and b2.button(
+                            "Delete this saved statement", key="del_is"):
+                        doc_delete("sage_is", choice_is)
+                        st.success("Deleted. Refresh the page.")
+                else:
+                    st.warning("No database configured, so this cannot be saved yet.")
 
     with tab_gl:
-        up_gl = st.file_uploader("General ledger export", type=["xlsx", "xls", "csv"],
-                                 key="gl_upload")
-        if up_gl is None:
+        choice_gl, rows_gl = stored_picker(
+            "sage_gl", "Saved general ledgers",
+            "No ledgers saved yet. Upload one and you can save it below.")
+
+        body_gl, gl_name = None, ""
+        if choice_gl == "Upload a new file":
+            up_gl = st.file_uploader("General ledger export",
+                                     type=["xlsx", "xls", "csv"], key="gl_upload")
+            if up_gl is not None:
+                body_gl = sheet_text(up_gl, up_gl.name)
+                gl_name = Path(up_gl.name).stem
+        else:
+            body_gl = raw_get("sage_gl", choice_gl)
+            gl_name = choice_gl
+            if body_gl is not None:
+                st.success(f"Loaded saved ledger: {choice_gl}")
+
+        if body_gl is None:
             st.info("Upload the GL export to browse transactions by account and month.")
         else:
             try:
-                gl = read_general_ledger(up_gl, up_gl.name)
+                gl = read_general_ledger(io.StringIO(body_gl), "saved.csv")
             except Exception as exc:
                 st.error(f"Could not read that file: {exc}")
-                st.stop()
+                gl = pd.DataFrame()
 
             if gl.empty:
                 st.warning("No transactions found in that file.")
-                st.stop()
-
-            a, b, c, d = st.columns(4)
-            a.metric("Transactions", f"{len(gl):,}")
-            b.metric("Accounts", f"{gl['Account'].nunique():,}")
-            c.metric("Total debits", MONEY.format(gl["Debit"].sum()))
-            d.metric("Total credits", MONEY.format(gl["Credit"].sum()))
-
-            gap = gl["Debit"].sum() - gl["Credit"].sum()
-            if abs(gap) < 0.01:
-                st.success("Debits and credits balance.")
             else:
-                st.warning(f"Debits and credits differ by {MONEY.format(gap)}.")
 
-            st.subheader("Activity by month")
-            money_table(gl_by_month(gl))
+                a, b, c, d = st.columns(4)
+                a.metric("Transactions", f"{len(gl):,}")
+                b.metric("Accounts", f"{gl['Account'].nunique():,}")
+                c.metric("Total debits", MONEY.format(gl["Debit"].sum()))
+                d.metric("Total credits", MONEY.format(gl["Credit"].sum()))
 
-            st.subheader("Activity by account")
-            accounts = gl_by_account(gl)
-            money_table(accounts.head(40))
+                gap = gl["Debit"].sum() - gl["Credit"].sum()
+                if abs(gap) < 0.01:
+                    st.success("Debits and credits balance.")
+                else:
+                    st.warning(f"Debits and credits differ by {MONEY.format(gap)}.")
 
-            st.subheader("Transaction lookup")
-            f1, f2 = st.columns(2)
-            labels = ["All accounts"] + [
-                f"{r.Account} - {r._2}" for r in
-                accounts[["Account", "Account Name"]].itertuples()
-            ]
-            pick = f1.selectbox("Account", labels)
-            month_pick = f2.selectbox("Month", ["All months"] +
-                                      sorted(gl["Month"].unique().tolist()))
-            search = st.text_input("Search the description")
+                st.subheader("Activity by month")
+                money_table(gl_by_month(gl))
 
-            view = gl.copy()
-            if pick != "All accounts":
-                view = view[view["Account"] == pick.split(" - ")[0]]
-            if month_pick != "All months":
-                view = view[view["Month"] == month_pick]
-            if search.strip():
-                view = view[view["Description"].str.contains(search.strip(),
-                                                             case=False, na=False)]
+                st.subheader("Activity by account")
+                accounts = gl_by_account(gl)
+                money_table(accounts.head(40))
 
-            st.caption(f"{len(view):,} matching transactions  ·  net "
-                       + MONEY.format(view["Net"].sum()))
-            st.dataframe(
-                view[["Date", "Account", "Account Name", "Reference", "Journal",
-                      "Description", "Debit", "Credit"]].style.format(
-                    {"Debit": MONEY, "Credit": MONEY}),
-                use_container_width=True, hide_index=True,
-            )
+                st.subheader("Transaction lookup")
+                f1, f2 = st.columns(2)
+                labels = ["All accounts"] + [
+                    f"{r.Account} - {r._2}" for r in
+                    accounts[["Account", "Account Name"]].itertuples()
+                ]
+                pick = f1.selectbox("Account", labels)
+                month_pick = f2.selectbox("Month", ["All months"] +
+                                          sorted(gl["Month"].unique().tolist()))
+                search = st.text_input("Search the description")
 
-            st.download_button(
-                "Download these transactions (CSV)",
-                data=view.to_csv(index=False),
-                file_name="sage-gl-filtered.csv",
-                mime="text/csv",
-            )
+                view = gl.copy()
+                if pick != "All accounts":
+                    view = view[view["Account"] == pick.split(" - ")[0]]
+                if month_pick != "All months":
+                    view = view[view["Month"] == month_pick]
+                if search.strip():
+                    view = view[view["Description"].str.contains(search.strip(),
+                                                                 case=False, na=False)]
+
+                st.caption(f"{len(view):,} matching transactions  ·  net "
+                           + MONEY.format(view["Net"].sum()))
+                st.dataframe(
+                    view[["Date", "Account", "Account Name", "Reference", "Journal",
+                          "Description", "Debit", "Credit"]].style.format(
+                        {"Debit": MONEY, "Credit": MONEY}),
+                    use_container_width=True, hide_index=True,
+                )
+
+                st.download_button(
+                    "Download these transactions (CSV)",
+                    data=view.to_csv(index=False),
+                    file_name="sage-gl-filtered.csv",
+                    mime="text/csv",
+                )
+
+                st.divider()
+                st.subheader("Save this ledger")
+                if db_ready():
+                    name_gl = st.text_input("Name for this ledger",
+                                            value=gl_name or "general ledger",
+                                            key="name_gl")
+                    g1, g2 = st.columns(2)
+                    if g1.button("Save to database", key="save_gl"):
+                        raw_put("sage_gl", name_gl, body_gl,
+                                notes=f"{len(gl):,} transactions")
+                        st.success(f"Saved as {name_gl}.")
+                    if choice_gl != "Upload a new file" and g2.button(
+                            "Delete this saved ledger", key="del_gl"):
+                        doc_delete("sage_gl", choice_gl)
+                        st.success("Deleted. Refresh the page.")
+                else:
+                    st.warning("No database configured, so this cannot be saved yet.")
 
 elif page == "Cash Flow":
     st.write("Cash position projected forward from today using your payment timing rules.")
