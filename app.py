@@ -749,15 +749,34 @@ elif page == "Payroll":
     )
     monthly_payroll = s["net"] * 2
     monthly_css = (s["employer_cost"] + s["employee_statutory"]) * 2
+    monthly_viatico = s["viatico"] * 2
+    # Decimo is one month of pay per year, paid in three installments, so each
+    # installment covers four months of accrual. This period is one quincena,
+    # and four months is eight quincenas.
+    decimo_payment = s["decimo_accrued"] * 8
+
     i, j = st.columns(2)
     i.metric("Monthly payroll cash", MONEY.format(monthly_payroll))
     j.metric("Monthly CSS / government", MONEY.format(monthly_css))
+    k2, l2 = st.columns(2)
+    k2.metric("Monthly viatico", MONEY.format(monthly_viatico))
+    l2.metric("Decimo per payment", MONEY.format(decimo_payment))
+    st.caption(
+        "Decimo per payment is this period's accrual carried over four months, "
+        "since each of the three payments covers a third of the year. Pluxee is "
+        "not part of the planilla, so it stays a manual entry on the Cash Flow page."
+    )
     if st.button("Update my Cash Flow numbers"):
         saved = load_settings()
         saved["payroll"] = round(monthly_payroll, 2)
         saved["css"] = round(monthly_css, 2)
+        saved["viatico"] = round(monthly_viatico, 2)
+        saved["decimo"] = round(decimo_payment, 2)
         save_settings(saved)
-        st.success("Cash Flow updated. Open the Cash Flow page to see the effect.")
+        st.success(
+            "Cash Flow updated with payroll, CSS, viatico, and decimo. "
+            "Open the Cash Flow page to see the effect."
+        )
 
     st.divider()
     st.subheader("Save this period")
