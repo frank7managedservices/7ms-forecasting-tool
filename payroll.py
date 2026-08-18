@@ -193,7 +193,30 @@ def _total(df, columns):
     return float(sum(col(df, c).sum() for c in columns))
 
 
-def accrual_breakdown(df):
+PERIOD_KINDS = {
+    "QUINCENAL": ("Quincenal - twice a month", 2.0),
+    "MENSUAL": ("Mensual - once a month", 1.0),
+    "BISEMANAL": ("Bisemanal - every two weeks", 2.1667),
+    "SEMANAL": ("Semanal - weekly", 4.3333),
+    "DIARIO": ("Diario", 30.0),
+}
+
+
+def period_kind(meta):
+    """Work out how often this planilla runs, straight from the report header.
+
+    A quincenal file covers half a month, so monthly figures are double it. A
+    mensual file already covers the whole month and must not be doubled, which
+    is the difference between a correct payroll line and one twice its size.
+    """
+    text = " ".join(str(v).upper() for v in (meta or {}).values())
+    for key, (label, per_month) in PERIOD_KINDS.items():
+        if key in text:
+            return label, per_month
+    return "Not stated in the file", 2.0
+
+
+def accrual_breakdown(df, per_month=2.0):
     """One row per benefit line, split into what is cash and what is accrued."""
     rows = []
     for label, columns in BENEFIT_CASH_LINES:
@@ -203,7 +226,7 @@ def accrual_breakdown(df):
         rows.append({"Line": label, "This period": _total(df, columns),
                      "Treatment": "Accrued only - no cash yet"})
     out = pd.DataFrame(rows)
-    out["Monthly"] = out["This period"] * 2
+    out["Monthly"] = out["This period"] * per_month
     return out[out["This period"] != 0]
 
 

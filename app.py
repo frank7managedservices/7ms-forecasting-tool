@@ -949,16 +949,38 @@ elif page == "Payroll":
 
     st.divider()
     st.subheader("Send to Cash Flow")
+    period_label, detected = payroll.period_kind(meta)
     st.caption(
-        "This period is one quincena, so the monthly figures are double these amounts."
+        "This file covers one pay period. To get monthly figures the amounts "
+        "are multiplied by how many times payroll runs in a month. Read from "
+        f"the file: {period_label}."
     )
-    monthly_payroll = s["net"] * 2
-    monthly_css = (s["employer_cost"] + s["employee_statutory"]) * 2
-    monthly_viatico = s["viatico"] * 2
-    # Decimo is one month of pay per year, paid in three installments, so each
-    # installment covers four months of accrual. This period is one quincena,
-    # and four months is eight quincenas.
-    decimo_payment = s["decimo_accrued"] * 8
+    period_choices = {
+        "Quincenal - twice a month": 2.0,
+        "Mensual - once a month": 1.0,
+        "Bisemanal - every two weeks": 2.1667,
+        "Semanal - weekly": 4.3333,
+    }
+    names = list(period_choices)
+    default_name = next((n for n in names if period_choices[n] == detected),
+                        names[0])
+    picked = st.selectbox(
+        "How often payroll runs", names, index=names.index(default_name),
+        help="If this file already covers a whole month, choose mensual so the "
+             "figures are not doubled.")
+    per_month = period_choices[picked]
+    st.caption(
+        f"Multiplier in use: {per_month:g}. Net pay in this file is "
+        + MONEY.format(s["net"]) + ", so monthly payroll cash is "
+        + MONEY.format(s["net"] * per_month) + "."
+    )
+
+    monthly_payroll = s["net"] * per_month
+    monthly_css = (s["employer_cost"] + s["employee_statutory"]) * per_month
+    monthly_viatico = s["viatico"] * per_month
+    # Decimo is one month of pay a year paid in three installments, so each
+    # installment covers four months of accrual.
+    decimo_payment = s["decimo_accrued"] * per_month * 4
 
     i, j = st.columns(2)
     i.metric("Monthly payroll cash", MONEY.format(monthly_payroll))
@@ -979,16 +1001,16 @@ elif page == "Payroll":
         "because somebody was actually paid vacation, a decimo advance, or a "
         "liquidacion, and those amounts already sit inside net pay."
     )
-    split = payroll.accrual_breakdown(df)
+    split = payroll.accrual_breakdown(df, per_month)
     if split.empty:
         st.info("This period has no benefit or provision lines.")
     else:
         money_table(split)
 
     tot = payroll.accrual_totals(df)
-    regular_payroll = (s["net"] - tot["benefit_cash_total"]) * 2
-    decimo_provision = tot["decimo_accrued"] * 2
-    vacation_provision = tot["vacation_accrued"] * 2
+    regular_payroll = (s["net"] - tot["benefit_cash_total"]) * per_month
+    decimo_provision = tot["decimo_accrued"] * per_month
+    vacation_provision = tot["vacation_accrued"] * per_month
 
     n1, n2, n3 = st.columns(3)
     n1.metric("Accrued this period, no cash",
@@ -1044,7 +1066,7 @@ elif page == "Payroll":
         )
     st.info(
         "One caution on cash basis: net pay already contains "
-        + MONEY.format(tot["decimo_cash"] * 2)
+        + MONEY.format(tot["decimo_cash"] * per_month)
         + " a month of decimo advances paid through the planilla. If you also "
         "charge the full decimo lump, that much is counted twice. Reduce the "
         "decimo figure on the Cash Flow page if these advances are common."
