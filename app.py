@@ -235,6 +235,149 @@ def money_table(df):
     st.dataframe(df.style.format(fmt), use_container_width=True, hide_index=True)
 
 
+# ---------------------------------------------------------------------------
+# Sage 50 imports: 12-month income statement and general ledger detail.
+# ---------------------------------------------------------------------------
+
+SECTION_HEADERS = {"Revenues", "Cost of Sales", "Expenses"}
+TOTAL_LABELS = {"Total Revenues", "Total Cost of Sales", "Total Expenses",
+                "Gross Profit", "Net Income"}
+
+
+def _read_any(file, name):
+    if str(name).lower().endswith(".csv"):
+        return pd.read_csv(file, header=None)
+    return pd.read_excel(file, header=None)
+
+
+def read_income_statement(file, name):
+    """Parse a Sage 50 12-period income statement into tidy rows.
+
+    Returns (lines, totals, periods) where lines has Section / Line / periods
+    and totals has one row per total or subtotal line.
+    """
+    raw = _read_any(file, name)
+
+    header = raw.iloc[0].tolist()
+    periods = [str(h) for h in header[1:] if isinstance(h, str) and h.strip()]
+    ncols = len(periods)
+
+    lines, totals, section = [], [], "Revenues"
+
+    for _, row in raw.iloc[1:].iterrows():
+        label = row[0]
+        if not isinstance(label, str) or not label.strip():
+            continue
+        label = label.strip()
+        values = pd.to_numeric(row[1:1 + ncols], errors="coerce").fillna(0.0)
+
+        if label in SECTION_HEADERS and values.abs().sum() == 0:
+            section = label
+            continue
+
+        record = {"Section": section, "Line": label}
+        record.update({p: float(v) for p, v in zip(periods, values)})
+
+        if label in TOTAL_LABELS or label.startswith("Total "):
+            totals.append(record)
+        else:
+            record["Total"] = float(values.sum())
+            if record["Total"] != 0:
+                lines.append(record)
+
+    return pd.DataFrame(lines), pd.DataFrame(totals), periods
+
+
+def income_summary(totals, periods):
+    """Pull the headline figures out of the totals table."""
+    out = {}
+    for key in ["Total Revenues", "Total Cost of Sales", "Total Expenses",
+                "Gross Profit", "Net Income"]:
+        hit = totals[totals["Line"] == key]
+        if hit.empty:
+            out[key] = 0.0
+        else:
+            out[key] = float(hit.iloc[0][periods].sum())
+    return out
+
+
+def monthly_series(totals, periods):
+    """One row per period with revenue, cost of sales, expenses, net income."""
+    def grab(key):
+        hit = totals[totals["Line"] == key]
+        if hit.empty:
+            return [0.0] * len(periods)
+        return [float(hit.iloc[0][p]) for p in periods]
+
+    return pd.DataFrame({
+        "Period": periods,
+        "Revenue": grab("Total Revenues"),
+        "Cost of Sales": grab("Total Cost of Sales"),
+        "Expenses": grab("Total Expenses"),
+        "Net Income": grab("Net Income"),
+    })
+
+
+def read_general_ledger(file, name):
+    """Parse a Sage 50 general ledger export into one row per transaction."""
+    raw = _read_any(file, name)
+
+    account_id = None
+    account_desc = None
+    rows = []
+
+    for _, row in raw.iloc[2:].iterrows():
+        if pd.notna(row[0]) and str(row[0]).strip() not in ("", "Account ID"):
+            account_id = str(row[0]).strip()
+        if pd.notna(row[1]) and str(row[1]).strip() not in ("", "Account Description"):
+            account_desc = str(row[1]).strip()
+
+        desc = row[5] if len(row) > 5 else None
+        if not isinstance(desc, str):
+            continue
+        desc = desc.strip()
+        if desc in ("Beginning Balance", "Current Period Change", "Trans Description"):
+            continue
+
+        stamp = pd.to_datetime(row[2], errors="coerce")
+        if pd.isna(stamp):
+            continue
+
+        debit = pd.to_numeric(row[6], errors="coerce")
+        credit = pd.to_numeric(row[7], errors="coerce")
+
+        rows.append({
+            "Account": account_id or "",
+            "Account Name": account_desc or "",
+            "Date": stamp.date(),
+            "Month": stamp.strftime("%Y-%m"),
+            "Reference": "" if pd.isna(row[3]) else str(row[3]),
+            "Journal": "" if pd.isna(row[4]) else str(row[4]),
+            "Description": desc,
+            "Debit": 0.0 if pd.isna(debit) else float(debit),
+            "Credit": 0.0 if pd.isna(credit) else float(credit),
+        })
+
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df["Net"] = df["Debit"] - df["Credit"]
+    return df
+
+
+def gl_by_account(df):
+    g = df.groupby(["Account", "Account Name"], as_index=False).agg(
+        Entries=("Net", "size"), Debit=("Debit", "sum"),
+        Credit=("Credit", "sum"), Net=("Net", "sum"))
+    return g.sort_values("Net", key=abs, ascending=False)
+
+
+def gl_by_month(df):
+    g = df.groupby("Month", as_index=False).agg(
+        Entries=("Net", "size"), Debit=("Debit", "sum"),
+        Credit=("Credit", "sum"), Net=("Net", "sum"))
+    return g.sort_values("Month")
+
+
 st.sidebar.title("7MS Forecasting Tool")
 page = st.sidebar.radio(
     "Go to",
@@ -500,8 +643,178 @@ elif page == "Terminations":
         )
 
 elif page == "Sage Actuals":
-    st.write("Sage 50 GL and income statement actuals.")
-    st.info("Sage import will be added here.")
+    st.write(
+        "Upload your Sage 50 reports to see actual results. The 12-month income "
+        "statement gives revenue, cost of sales, and net income by period. The "
+        "general ledger export gives transaction-level detail behind each account."
+    )
+
+    tab_is, tab_gl = st.tabs(["Income Statement", "General Ledger"])
+
+    with tab_is:
+        up = st.file_uploader("12-month income statement", type=["xlsx", "xls", "csv"],
+                             key="is_upload")
+        if up is None:
+            st.info("Upload the income statement to see actuals by period.")
+        else:
+            try:
+                lines, totals, periods = read_income_statement(up, up.name)
+            except Exception as exc:
+                st.error(f"Could not read that file: {exc}")
+                st.stop()
+
+            summary = income_summary(totals, periods)
+            a, b, c, d = st.columns(4)
+            a.metric("Total revenue", MONEY.format(summary["Total Revenues"]))
+            b.metric("Cost of sales", MONEY.format(summary["Total Cost of Sales"]))
+            c.metric("Operating expenses", MONEY.format(summary["Total Expenses"]))
+            d.metric("Net income", MONEY.format(summary["Net Income"]))
+
+            months = len(periods)
+            e, f, g = st.columns(3)
+            e.metric("Gross profit", MONEY.format(summary["Gross Profit"]))
+            margin = (summary["Gross Profit"] / summary["Total Revenues"] * 100
+                      if summary["Total Revenues"] else 0.0)
+            f.metric("Gross margin", f"{margin:.1f}%")
+            g.metric("Average monthly revenue",
+                     MONEY.format(summary["Total Revenues"] / months if months else 0))
+
+            if summary["Net Income"] < 0:
+                st.error(
+                    "Net loss for the period of "
+                    + MONEY.format(abs(summary["Net Income"]))
+                )
+            else:
+                st.success("Net profit for the period.")
+
+            series = monthly_series(totals, periods)
+
+            st.subheader("Revenue vs cost by period")
+            st.bar_chart(series.set_index("Period")[["Revenue", "Cost of Sales",
+                                                     "Expenses"]])
+
+            st.subheader("Net income by period")
+            st.bar_chart(series.set_index("Period")["Net Income"])
+
+            st.subheader("Totals by period")
+            money_table(series)
+
+            st.subheader("Line detail")
+            section = st.radio("Section", ["Cost of Sales", "Expenses", "Revenues"],
+                               horizontal=True)
+            part = lines[lines["Section"] == section].copy()
+            part = part[["Line", "Total"] + periods].sort_values("Total",
+                                                                 ascending=False)
+            money_table(part)
+
+            biggest = part.head(10)[["Line", "Total"]].set_index("Line")
+            st.subheader(f"Largest {section.lower()} lines")
+            st.bar_chart(biggest)
+
+            st.divider()
+            st.subheader("Send to Cash Flow")
+            st.caption(
+                "Non-payroll cost lines averaged per month. Payroll, CSS, viatico, "
+                "and decimo are already tracked separately from the planilla, so "
+                "they are left out of this figure."
+            )
+            payroll_words = ["salario", "salary", "xiii", "vacacion", "seguro social",
+                             "seguro educativo", "riesgos", "indemniza",
+                             "prima de antiguedad", "preaviso", "viatico", "wages",
+                             "payroll tax"]
+            other = lines[
+                lines["Section"].isin(["Cost of Sales", "Expenses"])
+                & ~lines["Line"].str.lower().str.contains("|".join(payroll_words))
+            ]
+            monthly_other = other["Total"].sum() / months if months else 0.0
+            st.metric("Average monthly other fixed expenses",
+                      MONEY.format(monthly_other))
+            with st.expander("Which lines are included"):
+                money_table(other[["Section", "Line", "Total"]]
+                            .sort_values("Total", ascending=False))
+            if st.button("Use this as my other fixed expenses"):
+                saved = load_settings()
+                saved["fixed"] = round(monthly_other, 2)
+                save_settings(saved)
+                st.success("Cash Flow updated. Open the Cash Flow page to see it.")
+
+            st.download_button(
+                "Download line detail (CSV)",
+                data=lines.to_csv(index=False),
+                file_name="sage-income-lines.csv",
+                mime="text/csv",
+            )
+
+    with tab_gl:
+        up_gl = st.file_uploader("General ledger export", type=["xlsx", "xls", "csv"],
+                                 key="gl_upload")
+        if up_gl is None:
+            st.info("Upload the GL export to browse transactions by account and month.")
+        else:
+            try:
+                gl = read_general_ledger(up_gl, up_gl.name)
+            except Exception as exc:
+                st.error(f"Could not read that file: {exc}")
+                st.stop()
+
+            if gl.empty:
+                st.warning("No transactions found in that file.")
+                st.stop()
+
+            a, b, c, d = st.columns(4)
+            a.metric("Transactions", f"{len(gl):,}")
+            b.metric("Accounts", f"{gl['Account'].nunique():,}")
+            c.metric("Total debits", MONEY.format(gl["Debit"].sum()))
+            d.metric("Total credits", MONEY.format(gl["Credit"].sum()))
+
+            gap = gl["Debit"].sum() - gl["Credit"].sum()
+            if abs(gap) < 0.01:
+                st.success("Debits and credits balance.")
+            else:
+                st.warning(f"Debits and credits differ by {MONEY.format(gap)}.")
+
+            st.subheader("Activity by month")
+            money_table(gl_by_month(gl))
+
+            st.subheader("Activity by account")
+            accounts = gl_by_account(gl)
+            money_table(accounts.head(40))
+
+            st.subheader("Transaction lookup")
+            f1, f2 = st.columns(2)
+            labels = ["All accounts"] + [
+                f"{r.Account} - {r._2}" for r in
+                accounts[["Account", "Account Name"]].itertuples()
+            ]
+            pick = f1.selectbox("Account", labels)
+            month_pick = f2.selectbox("Month", ["All months"] +
+                                      sorted(gl["Month"].unique().tolist()))
+            search = st.text_input("Search the description")
+
+            view = gl.copy()
+            if pick != "All accounts":
+                view = view[view["Account"] == pick.split(" - ")[0]]
+            if month_pick != "All months":
+                view = view[view["Month"] == month_pick]
+            if search.strip():
+                view = view[view["Description"].str.contains(search.strip(),
+                                                             case=False, na=False)]
+
+            st.caption(f"{len(view):,} matching transactions  ·  net "
+                       + MONEY.format(view["Net"].sum()))
+            st.dataframe(
+                view[["Date", "Account", "Account Name", "Reference", "Journal",
+                      "Description", "Debit", "Credit"]].style.format(
+                    {"Debit": MONEY, "Credit": MONEY}),
+                use_container_width=True, hide_index=True,
+            )
+
+            st.download_button(
+                "Download these transactions (CSV)",
+                data=view.to_csv(index=False),
+                file_name="sage-gl-filtered.csv",
+                mime="text/csv",
+            )
 
 elif page == "Cash Flow":
     st.write("Cash position projected forward from today using your payment timing rules.")
