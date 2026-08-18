@@ -39,6 +39,12 @@ GROUP_MAP = {
     "VICE PRESIDENT": "Vice President",
 }
 
+# Fixes for employees whose job title does not identify their group.
+# Keyed by ID_EMP so a reused title like "POR DEFINIR" cannot mislabel a new hire.
+EMPLOYEE_OVERRIDES = {
+    "218353": "President",
+}
+
 
 def find_header_row(raw, marker="INGRESO_BRUTO", limit=40):
     """Locate the row index that holds the column headings."""
@@ -91,6 +97,9 @@ def read_payroll(file_like, name=""):
         df["GRUPO"] = "Other / Unmapped"
         df["CARGO_LIMPIO"] = ""
 
+        if "ID_EMP" in df.columns:
+        ids = df["ID_EMP"].astype(str).str.split(".").str[0].str.strip()
+        df["GRUPO"] = [EMPLOYEE_OVERRIDES.get(i, g) for i, g in zip(ids, df["GRUPO"])]
     if "NOMBRE" in df.columns:
         df["NOMBRE"] = df["NOMBRE"].astype(str).str.replace(r"\s+", " ", regex=True).str.strip()
 
