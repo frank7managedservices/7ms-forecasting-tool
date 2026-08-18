@@ -1094,11 +1094,32 @@ elif page == "Payroll":
     per_month = period_choices[picked]
     st.caption(
         f"Multiplier in use: {per_month:g}. Net pay in this file is "
-        + MONEY.format(s["net"]) + ". Regular pay after taking out one-off "
-        "decimo and liquidacion payouts is "
-        + MONEY.format(s["net"] - one_off) + ", so monthly payroll cash is "
+        + MONEY.format(s["net"]) + ". Take out one-off decimo and liquidacion "
+        "payouts and it is " + MONEY.format(s["net"] - one_off)
+        + (", then add " + MONEY.format(third_cash)
+           + " withheld for third parties" if include_third else
+           ", with third party deductions left out")
+        + ", so monthly payroll cash is "
         + MONEY.format(monthly_payroll) + "."
     )
+    with st.expander("Third party deductions inside this payroll run"):
+        st.caption(
+            "These are the employee's own obligations, deducted from their pay. "
+            "The company is only the middleman, but the cash still crosses the "
+            "bank account on its way to the cooperative or finance company, so "
+            "counting it keeps the projected balance honest. Employee "
+            "receivables are excluded, since that money comes back to you."
+        )
+        if third["detail"].empty:
+            st.info("Nothing withheld for third parties in this period.")
+        else:
+            money_table(third["detail"])
+        st.caption(
+            "Per period " + MONEY.format(third["remitted"]) + ", or "
+            + MONEY.format(third["remitted"] * per_month) + " a month. "
+            "Employee receivables coming back in: "
+            + MONEY.format(third["receivable"]) + " per period."
+        )
     if one_off > 0:
         st.warning(
             "This period includes "
@@ -1116,7 +1137,15 @@ elif page == "Payroll":
     # liquidacion. Doubling either one invents cash that will never go out, so
     # both are stripped out here and tracked on their own lines instead.
     one_off = tot_early["decimo_cash"] + tot_early["liquidacion_cash"]
-    monthly_payroll = (s["net"] - one_off) * per_month
+    third = payroll.third_party_deductions(df)
+    include_third = st.checkbox(
+        "Include third party deductions in payroll cash", value=True,
+        help="These are the employee's own debts, funded out of their pay, but "
+             "the company writes the cheque to the cooperative or finance "
+             "company. Ticked, the cash leaves the bank. Unticked, it is "
+             "treated as the employee's affair and left out entirely.")
+    third_cash = third["remitted"] if include_third else 0.0
+    monthly_payroll = (s["net"] - one_off + third_cash) * per_month
     monthly_css = (s["employer_cost"] + s["employee_statutory"]
                    - tot_early["isr_on_liquidacion"]) * per_month
     monthly_viatico = s["viatico"] * per_month
@@ -1150,7 +1179,8 @@ elif page == "Payroll":
         money_table(split)
 
     tot = payroll.accrual_totals(df)
-    regular_payroll = (s["net"] - tot["benefit_cash_total"]) * per_month
+    regular_payroll = (s["net"] - tot["benefit_cash_total"]
+                       + third_cash) * per_month
     decimo_provision = tot["decimo_accrued"] * per_month
     vacation_provision = tot["vacation_accrued"] * per_month
 

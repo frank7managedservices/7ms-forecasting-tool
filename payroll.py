@@ -253,3 +253,39 @@ def accrual_totals(df):
             + benefit_cash["Preaviso paid"]
             + benefit_cash["Indemnizacion paid"]),
     }
+
+# Money withheld from employees that the company forwards to somebody else:
+# cooperatives, finance companies, garnishments. It leaves the bank with the
+# payroll run, but it is not part of net pay and it is not a government tax, so
+# without this it goes missing from the forecast entirely.
+COMPANY_RECEIVABLE_COLUMNS = ["CXCEMP"]
+
+
+def third_party_deductions(df):
+    """What is withheld and remitted to third parties, per period.
+
+    Total deductions less the employee's own statutory taxes leaves the
+    third-party items. Employee receivables are taken out, because that money
+    comes back to the company rather than going out of it.
+    """
+    total_deductions = float(col(df, "TOTAL_RETENCIONES").sum())
+    statutory = float(
+        col(df, "DED_SS").sum() + col(df, "DED_SE").sum()
+        + col(df, "DED_ISR").sum() + col(df, "DED_ISR_GREP").sum()
+        + col(df, "DED_ISR_LIQ").sum())
+    receivable = float(sum(col(df, c).sum() for c in COMPANY_RECEIVABLE_COLUMNS))
+    remitted = total_deductions - statutory - receivable
+    named = {c: float(col(df, c).sum()) for c in LOAN_COLUMNS
+             if c not in COMPANY_RECEIVABLE_COLUMNS and float(col(df, c).sum())}
+    identified = sum(named.values())
+    detail = pd.DataFrame(
+        [{"Program": k, "Amount": v} for k, v in named.items()]
+        + ([{"Program": "Other withheld amounts", "Amount": remitted - identified}]
+           if round(remitted - identified, 2) else [])
+    )
+    return {
+        "remitted": max(remitted, 0.0),
+        "receivable": receivable,
+        "detail": detail.sort_values("Amount", ascending=False)
+                  if not detail.empty else detail,
+    }
