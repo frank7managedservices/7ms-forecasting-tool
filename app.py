@@ -1342,30 +1342,72 @@ elif page == "Sage Actuals":
                     "separately from the planilla, so they are left out of this figure."
                 )
                 payroll_words = ["salario", "salary", "xiii", "vacacion", "seguro social",
-                                 "seguro educativo", "riesgos", "indemniza",
-                                 "prima de antiguedad", "preaviso", "viatico", "wages",
-                                 "payroll tax"]
-                other = lines[
-                    lines["Section"].isin(["Cost of Sales", "Expenses"])
-                    & ~lines["Line"].str.lower().str.contains("|".join(payroll_words))
+                                 "seguro educativo", "seguro educat", "riesgos",
+                                 "indemniza", "prima de antiguedad", "preaviso",
+                                 "viatico", "wages", "payroll tax"]
+                cost = lines[lines["Section"].isin(["Cost of Sales", "Expenses"])].copy()
+                cost["Selected Total"] = cost[avg_periods].sum(axis=1)
+                cost["Label"] = cost["Section"] + " - " + cost["Line"]
+
+                suggested = [
+                    r["Label"] for _, r in cost.iterrows()
+                    if any(w in str(r["Line"]).lower() for w in payroll_words)
                 ]
-                other = other.copy()
-                other["Selected Total"] = other[avg_periods].sum(axis=1)
+                remembered = kv_get("excluded_lines")
+                if isinstance(remembered, list) and remembered:
+                    default_excluded = [x for x in remembered
+                                        if x in set(cost["Label"])]
+                else:
+                    default_excluded = suggested
+
+                st.caption(
+                    "Anything already tracked from the planilla has to come out of "
+                    "this figure or it is counted twice. Wage and statutory lines "
+                    "are ticked for you. Add management or support compensation, "
+                    "professional fees, or any other line that payroll already "
+                    "covers. Your choice is remembered."
+                )
+                excluded = st.multiselect(
+                    "Lines to leave out, because payroll already covers them",
+                    options=sorted(cost["Label"]), default=default_excluded)
+
+                left_out = cost[cost["Label"].isin(excluded)]
+                other = cost[~cost["Label"].isin(excluded)]
                 monthly_other = (other["Selected Total"].sum() / months
                                  if months else 0.0)
-                o1, o2 = st.columns(2)
+                monthly_left_out = (left_out["Selected Total"].sum() / months
+                                    if months else 0.0)
+
+                o1, o2, o3 = st.columns(3)
                 o1.metric("Average monthly other fixed expenses",
                           MONEY.format(monthly_other))
-                o2.metric(f"Total across {months} period(s)",
+                o2.metric("Left out, per month",
+                          MONEY.format(monthly_left_out))
+                o3.metric(f"Included total across {months} period(s)",
                           MONEY.format(other["Selected Total"].sum()))
+
                 with st.expander("Which lines are included"):
                     money_table(other[["Section", "Line", "Selected Total", "Total"]]
                                 .sort_values("Selected Total", ascending=False))
+                with st.expander("Which lines were left out"):
+                    if left_out.empty:
+                        st.info("Nothing is being left out right now.")
+                    else:
+                        money_table(left_out[["Section", "Line", "Selected Total",
+                                              "Total"]]
+                                    .sort_values("Selected Total", ascending=False))
+
                 if st.button("Use this as my other fixed expenses"):
                     saved = load_settings()
                     saved["fixed"] = round(monthly_other, 2)
                     save_settings(saved)
-                    st.success("Cash Flow updated. Open the Cash Flow page to see it.")
+                    kv_put("excluded_lines", excluded)
+                    st.success(
+                        "Cash Flow other fixed expenses set to "
+                        + MONEY.format(monthly_other) + " per month, with "
+                        + MONEY.format(monthly_left_out)
+                        + " a month left out as already covered by payroll."
+                    )
 
                 st.download_button(
                     "Download line detail (CSV)",
