@@ -17,6 +17,7 @@ DEFAULTS = {
     "start_cash": 0.0,
     "revenue": 0.0,
     "revenue_mode": "Spread evenly",
+    "revenue_lag": 0,
     "revenue_day": 20,
     "horizon": 120,
     "end_date": str(date(date.today().year, 12, 31)),
@@ -453,6 +454,60 @@ def save_revenue_schedule(frame):
     return frame
 
 
+AGENT_COLUMNS = ["Month", "Agents", "Billable hours per agent",
+                 "Average rate per hour"]
+
+
+def load_agent_schedule():
+    rows = kv_get("agent_schedule")
+    if isinstance(rows, list) and rows:
+        frame = pd.DataFrame(rows)
+        for c in AGENT_COLUMNS:
+            if c not in frame.columns:
+                frame[c] = 0
+        return frame[AGENT_COLUMNS]
+    return pd.DataFrame(columns=AGENT_COLUMNS)
+
+
+def save_agent_schedule(frame):
+    frame = frame.dropna(subset=["Month"])
+    frame = frame[frame["Month"].astype(str).str.strip() != ""]
+    kv_put("agent_schedule", frame.to_dict("records"))
+    return frame
+
+
+def agent_billing(frame):
+    """Agents times billable hours times rate, per month."""
+    out = frame.copy()
+    for c in ["Agents", "Billable hours per agent", "Average rate per hour"]:
+        out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0.0)
+    out["Billed"] = (out["Agents"] * out["Billable hours per agent"]
+                     * out["Average rate per hour"])
+    return out
+
+
+def shift_month(label, months):
+    """Move a YYYY-MM label forward by a number of months."""
+    y, m = int(str(label)[:4]), int(str(label)[5:7])
+    total = y * 12 + (m - 1) + int(months)
+    return f"{total // 12:04d}-{total % 12 + 1:02d}"
+
+
+def agent_revenue_schedule(frame, day, lag):
+    """Turn the agent plan into collections, allowing for a payment lag.
+
+    Work billed in one month is often collected in the next, so the lag moves
+    each month's billing forward before it lands as cash.
+    """
+    billed = agent_billing(frame)
+    return pd.DataFrame([
+        {"Month": shift_month(r["Month"], lag),
+         "Expected collections": float(r["Billed"]),
+         "Day of month": int(day)}
+        for _, r in billed.iterrows()
+    ])
+
+
 def months_between(start, end):
     """List of YYYY-MM labels covering the projection window."""
     out, y, m = [], start.year, start.month
@@ -522,8 +577,9 @@ def build_schedule(s, horizon, severance=None, expenses=None, revenues=None):
                 continue
             due[max(1, min(day, 31))] = due.get(max(1, min(day, 31)), 0.0) + amount
 
+    mode_word = str(s.get("revenue_mode", "")).lower()
     by_month = (
-        str(s.get("revenue_mode", "")).lower().startswith("enter")
+        (mode_word.startswith("enter") or mode_word.startswith("build"))
         and revenues is not None and not revenues.empty
     )
     if by_month:
@@ -812,8 +868,13 @@ if page == "Dashboard":
         days = max((target - date.today()).days + 1, 30)
     except Exception:
         days = int(saved.get("horizon", 120))
-    df = build_schedule(saved, days, sev, load_expense_schedule(),
-                        load_revenue_schedule())
+    if saved.get("revenue_mode") == "Build from agent hours":
+        dash_rev = agent_revenue_schedule(load_agent_schedule(),
+                                          int(saved.get("revenue_day", 20)),
+                                          int(saved.get("revenue_lag", 0)))
+    else:
+        dash_rev = load_revenue_schedule()
+    df = build_schedule(saved, days, sev, load_expense_schedule(), dash_rev)
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Cash on hand", MONEY.format(saved["start_cash"]))
     c2.metric("Balance in 30 days", MONEY.format(df["Balance"].iloc[min(29, days - 1)]))
@@ -1640,7 +1701,8 @@ elif page == "Cash Flow":
             revenue = st.number_input("Monthly collections ($)", min_value=0.0,
                                       value=float(saved["revenue"]), step=1000.0)
             revenue_choices = ["Spread evenly", "One day per month",
-                               "Enter each month below"]
+                               "Enter each month below",
+                               "Build from agent hours"]
             revenue_mode = st.radio(
                 "Collections timing", revenue_choices,
                 index=(revenue_choices.index(saved["revenue_mode"])
@@ -1648,6 +1710,11 @@ elif page == "Cash Flow":
             )
             revenue_day = st.number_input("Collection day of month", 1, 31,
                                           int(saved["revenue_day"]))
+            revenue_lag = st.number_input(
+                "Months between billing and collection", 0, 6,
+                int(saved.get("revenue_lag", 0)),
+                help="Zero means work billed this month is collected this "
+                     "month. One means it arrives the following month.")
             end_date = st.date_input(
                 "Project through", value=default_end,
                 min_value=date.today() + timedelta(days=1),
@@ -1760,6 +1827,44 @@ elif page == "Cash Flow":
                 key="expense_editor",
             )
 
+        with st.expander("Revenue from agent hours"):
+            st.caption(
+                "Revenue is agents times billable hours times rate. Change the "
+                "headcount in any month and the revenue follows it, so a hiring "
+                "plan or a lost account shows up in cash. Used when collections "
+                "timing is set to build from agent hours."
+            )
+            saved_agents = load_agent_schedule()
+            wanted_a = months_between(date.today(), default_end)
+            if saved_agents.empty:
+                saved_agents = pd.DataFrame([
+                    {"Month": m, "Agents": 115,
+                     "Billable hours per agent": 140.0,
+                     "Average rate per hour": 19.75} for m in wanted_a
+                ])
+            else:
+                have_a = set(saved_agents["Month"].astype(str))
+                last = saved_agents.iloc[-1]
+                extra_a = [m for m in wanted_a if m not in have_a]
+                if extra_a:
+                    saved_agents = pd.concat([saved_agents, pd.DataFrame([
+                        {"Month": m, "Agents": last["Agents"],
+                         "Billable hours per agent": last["Billable hours per agent"],
+                         "Average rate per hour": last["Average rate per hour"]}
+                        for m in extra_a
+                    ])], ignore_index=True).sort_values("Month")
+            agent_rows = st.data_editor(
+                saved_agents, num_rows="dynamic", use_container_width=True,
+                hide_index=True, key="agent_editor",
+                column_config={
+                    "Agents": st.column_config.NumberColumn(min_value=0, step=1),
+                    "Billable hours per agent": st.column_config.NumberColumn(
+                        min_value=0.0, step=1.0),
+                    "Average rate per hour": st.column_config.NumberColumn(
+                        min_value=0.0, step=0.25, format="$%.2f"),
+                },
+            )
+
         with st.expander("Collections month by month"):
             st.caption(
                 "Revenue that changes every month goes here. Fill in what you "
@@ -1796,6 +1901,7 @@ elif page == "Cash Flow":
         "revenue": revenue,
         "revenue_mode": revenue_mode,
         "revenue_day": int(revenue_day),
+        "revenue_lag": int(revenue_lag),
         "payroll": payroll,
         "css": css,
         "pluxee": pluxee,
@@ -1820,6 +1926,7 @@ elif page == "Cash Flow":
         save_settings(current)
         save_expense_schedule(pd.DataFrame(expense_rows))
         save_revenue_schedule(pd.DataFrame(revenue_rows))
+        save_agent_schedule(pd.DataFrame(agent_rows))
         st.success("Saved. These numbers will load automatically next time.")
 
     if calculate or store:
@@ -1827,6 +1934,26 @@ elif page == "Cash Flow":
         days = int(horizon)
         exp_frame = pd.DataFrame(expense_rows)
         rev_frame = pd.DataFrame(revenue_rows)
+        agent_frame = pd.DataFrame(agent_rows)
+        if current["revenue_mode"] == "Build from agent hours":
+            rev_frame = agent_revenue_schedule(
+                agent_frame, int(revenue_day), int(revenue_lag))
+            billed = agent_billing(agent_frame)
+            st.subheader("Revenue built from agent hours")
+            money_table(billed[["Month", "Agents", "Billable hours per agent",
+                                "Average rate per hour", "Billed"]])
+            first = billed.iloc[0] if not billed.empty else None
+            if first is not None:
+                st.caption(
+                    f"{int(first['Agents'])} agents at "
+                    f"{first['Billable hours per agent']:g} hours and "
+                    + MONEY.format(first["Average rate per hour"])
+                    + " an hour bills " + MONEY.format(first["Billed"])
+                    + f" in {first['Month']}, collected on day "
+                    f"{int(revenue_day)} "
+                    + ("of the same month." if int(revenue_lag) == 0 else
+                       f"{int(revenue_lag)} month(s) later.")
+                )
 
         basis_options = ["Cash basis", "Accrual basis"]
         basis = st.radio(
@@ -1859,7 +1986,8 @@ elif page == "Cash Flow":
 
         collections_total = df["Collections"].sum()
         payments = int((df["Collections"] > 0).sum()) if current["revenue_mode"] != "Spread evenly" else 0
-        if current["revenue_mode"] == "Enter each month below":
+        if current["revenue_mode"] in ("Enter each month below",
+                                       "Build from agent hours"):
             st.caption(
                 f"Collections taken from your month-by-month table, "
                 f"{MONEY.format(collections_total)} in total over {days} days."
