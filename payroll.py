@@ -39,6 +39,7 @@ GROUP_MAP = {
     "VICE PRESIDENT": "Vice President",
 }
 
+
 # Fixes for employees whose job title does not identify their group.
 # Keyed by ID_EMP so a reused title like "POR DEFINIR" cannot mislabel a new hire.
 EMPLOYEE_OVERRIDES = {
@@ -164,3 +165,63 @@ def loan_detail(df):
         if total:
             rows.append({"Program": c, "Employees": count, "Amount": total})
     return pd.DataFrame(rows)
+
+# ---------------------------------------------------------------------------
+# Accrued versus cash. The planilla carries both: provision columns that never
+# leave the bank in the period (PROV_*, ACUM_XIII) and benefit payouts that do
+# leave the bank because someone was actually paid (vacation taken, a decimo
+# advance, a liquidacion).
+# ---------------------------------------------------------------------------
+
+ACCRUED_LINES = [
+    ("Decimo accrued this period", ["ACUM_XIII", "ACUM_XIII_GREP"]),
+    ("Vacation provision", ["PROV_VACACIONES", "PROV_VACGAS"]),
+    ("Prima de antiguedad provision", ["PROV_PRIMA"]),
+    ("Indemnizacion provision", ["PROV_INDEM"]),
+]
+
+BENEFIT_CASH_LINES = [
+    ("Vacation paid out", ["VACACIONES", "VACACIONES_GREP"]),
+    ("Decimo paid in this period", ["XIII_MES", "XIII_MES_GREP"]),
+    ("Prima de antiguedad paid", ["PRIMA_LIQ"]),
+    ("Preaviso paid", ["PREAVISO_LIQ"]),
+    ("Indemnizacion paid", ["INDEMNIZACION_LIQ"]),
+]
+
+
+def _total(df, columns):
+    return float(sum(col(df, c).sum() for c in columns))
+
+
+def accrual_breakdown(df):
+    """One row per benefit line, split into what is cash and what is accrued."""
+    rows = []
+    for label, columns in BENEFIT_CASH_LINES:
+        rows.append({"Line": label, "This period": _total(df, columns),
+                     "Treatment": "Cash - money left the bank"})
+    for label, columns in ACCRUED_LINES:
+        rows.append({"Line": label, "This period": _total(df, columns),
+                     "Treatment": "Accrued only - no cash yet"})
+    out = pd.DataFrame(rows)
+    out["Monthly"] = out["This period"] * 2
+    return out[out["This period"] != 0]
+
+
+def accrual_totals(df):
+    """Headline accrued and benefit-cash figures for one period."""
+    accrued = {label: _total(df, c) for label, c in ACCRUED_LINES}
+    benefit_cash = {label: _total(df, c) for label, c in BENEFIT_CASH_LINES}
+    return {
+        "accrued_total": float(sum(accrued.values())),
+        "benefit_cash_total": float(sum(benefit_cash.values())),
+        "decimo_accrued": float(accrued["Decimo accrued this period"]),
+        "vacation_accrued": float(accrued["Vacation provision"]),
+        "prima_accrued": float(accrued["Prima de antiguedad provision"]),
+        "indem_accrued": float(accrued["Indemnizacion provision"]),
+        "vacation_cash": float(benefit_cash["Vacation paid out"]),
+        "decimo_cash": float(benefit_cash["Decimo paid in this period"]),
+        "liquidacion_cash": float(
+            benefit_cash["Prima de antiguedad paid"]
+            + benefit_cash["Preaviso paid"]
+            + benefit_cash["Indemnizacion paid"]),
+    }

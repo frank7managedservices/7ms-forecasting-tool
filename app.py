@@ -6,6 +6,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
+import payroll
 from payroll import read_payroll, summarize, by_group, loan_detail
 
 st.set_page_config(page_title="7MS Forecasting Tool", page_icon="📈", layout="wide")
@@ -970,17 +971,84 @@ elif page == "Payroll":
         "since each of the three payments covers a third of the year. Pluxee is "
         "not part of the planilla, so it stays a manual entry on the Cash Flow page."
     )
-    if st.button("Update my Cash Flow numbers"):
+    st.divider()
+    st.subheader("What in this file is cash and what is only accrued")
+    st.caption(
+        "The planilla carries both. Provision columns build a liability and no "
+        "money leaves the bank in the period. Benefit payouts are real cash, "
+        "because somebody was actually paid vacation, a decimo advance, or a "
+        "liquidacion, and those amounts already sit inside net pay."
+    )
+    split = payroll.accrual_breakdown(df)
+    if split.empty:
+        st.info("This period has no benefit or provision lines.")
+    else:
+        money_table(split)
+
+    tot = payroll.accrual_totals(df)
+    regular_payroll = (s["net"] - tot["benefit_cash_total"]) * 2
+    decimo_provision = tot["decimo_accrued"] * 2
+    vacation_provision = tot["vacation_accrued"] * 2
+
+    n1, n2, n3 = st.columns(3)
+    n1.metric("Accrued this period, no cash",
+              MONEY.format(tot["accrued_total"]))
+    n2.metric("Benefit payouts inside net pay",
+              MONEY.format(tot["benefit_cash_total"]))
+    n3.metric("Regular payroll cash per month", MONEY.format(regular_payroll))
+    st.caption(
+        "Regular payroll cash strips the benefit payouts out of net pay, so it "
+        "is the ordinary wage run on its own. It is an estimate, since the file "
+        "does not split deductions line by line."
+    )
+
+    st.divider()
+    st.subheader("Which basis do you want to send")
+    st.caption(
+        "Cash basis sends all the money that actually leaves the bank, so net "
+        "pay stays whole and decimo lands as a lump on 15 April, 15 August and "
+        "15 December. Accrual basis sends the ordinary wage run plus monthly "
+        "decimo and vacation provisions, which is how your books carry it."
+    )
+    bc1, bc2 = st.columns(2)
+    if bc1.button("Send cash basis numbers"):
         saved = load_settings()
         saved["payroll"] = round(monthly_payroll, 2)
         saved["css"] = round(monthly_css, 2)
         saved["viatico"] = round(monthly_viatico, 2)
         saved["decimo"] = round(decimo_payment, 2)
+        saved["decimo_provision"] = 0.0
+        saved["vacation_provision"] = 0.0
+        saved["basis"] = "Cash basis"
         save_settings(saved)
         st.success(
-            "Cash Flow updated with payroll, CSS, viatico, and decimo. "
-            "Open the Cash Flow page to see the effect."
+            "Cash Flow set to cash basis: payroll "
+            + MONEY.format(monthly_payroll) + " per month, decimo "
+            + MONEY.format(decimo_payment) + " per payment, no provisions."
         )
+    if bc2.button("Send accrual basis numbers"):
+        saved = load_settings()
+        saved["payroll"] = round(regular_payroll, 2)
+        saved["css"] = round(monthly_css, 2)
+        saved["viatico"] = round(monthly_viatico, 2)
+        saved["decimo"] = round(decimo_payment, 2)
+        saved["decimo_provision"] = round(decimo_provision, 2)
+        saved["vacation_provision"] = round(vacation_provision, 2)
+        saved["basis"] = "Accrual basis"
+        save_settings(saved)
+        st.success(
+            "Cash Flow set to accrual basis: regular payroll "
+            + MONEY.format(regular_payroll) + " per month, decimo provision "
+            + MONEY.format(decimo_provision) + " and vacation provision "
+            + MONEY.format(vacation_provision) + " per month."
+        )
+    st.info(
+        "One caution on cash basis: net pay already contains "
+        + MONEY.format(tot["decimo_cash"] * 2)
+        + " a month of decimo advances paid through the planilla. If you also "
+        "charge the full decimo lump, that much is counted twice. Reduce the "
+        "decimo figure on the Cash Flow page if these advances are common."
+    )
 
     st.divider()
     st.subheader("Save this period")
@@ -1618,8 +1686,11 @@ elif page == "Cash Flow":
         exp_frame = pd.DataFrame(expense_rows)
         rev_frame = pd.DataFrame(revenue_rows)
 
+        basis_options = ["Cash basis", "Accrual basis"]
         basis = st.radio(
-            "View", ["Cash basis", "Accrual basis"], horizontal=True,
+            "View", basis_options, horizontal=True,
+            index=(basis_options.index(saved["basis"])
+                   if saved.get("basis") in basis_options else 0),
             help="Cash basis pays decimo as a lump on the 15th of April, "
                  "August and December and ignores vacation until it is paid. "
                  "Accrual basis charges monthly provisions instead.")
