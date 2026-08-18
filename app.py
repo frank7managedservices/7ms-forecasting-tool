@@ -21,6 +21,7 @@ DEFAULTS = {
     "css": 0.0,
     "pluxee": 0.0,
     "viatico": 0.0,
+    "decimo": 0.0,
     "fixed": 0.0,
 }
 
@@ -64,10 +65,11 @@ def build_schedule(s, horizon):
         pay = s["payroll"] / 2 if (d.day == 15 or is_last_day(d)) else 0.0
         css_out = s["css"] if is_last_day(d) else 0.0
         pluxee_out = s["pluxee"] if d.day == 15 else 0.0
+        decimo_out = s.get("decimo", 0.0) if (d.day == 15 and d.month in (4, 8, 12)) else 0.0
         viatico_out = s["viatico"] if d.day == 15 else 0.0
         fixed_out = s["fixed"] / dim
 
-        out = pay + css_out + pluxee_out + viatico_out + fixed_out
+        out = pay + css_out + pluxee_out + viatico_out + decimo_out + fixed_out
         balance += collections - out
 
         rows.append({
@@ -77,6 +79,7 @@ def build_schedule(s, horizon):
             "CSS / Government": css_out,
             "Pluxee": pluxee_out,
             "Viatico": viatico_out,
+            "Decimo": decimo_out,
             "Other Fixed": fixed_out,
             "Net": collections - out,
             "Balance": balance,
@@ -106,6 +109,10 @@ if page == "Dashboard":
     c2.metric("Balance in 30 days", MONEY.format(df["Balance"].iloc[29]))
     c3.metric("Balance in 90 days", MONEY.format(df["Balance"].iloc[-1]))
     c4.metric("Payroll this month", MONEY.format(saved["payroll"]))
+    st.caption(
+        "Decimo per payment: " + MONEY.format(saved.get("decimo", 0.0))
+        + "  ·  paid 15 April, 15 August, 15 December"
+    )
     st.line_chart(df.set_index("Date")["Balance"])
 
 elif page == "Forecast":
@@ -152,6 +159,20 @@ elif page == "Payroll":
         g.metric("Overtime", MONEY.format(s["overtime"]))
         h.metric("Viatico (non-taxable)", MONEY.format(s["viatico"]))
 
+        k, m, n, o = st.columns(4)
+        k.metric("Decimo paid (cash)", MONEY.format(s["decimo_paid"]))
+        m.metric("Decimo accrued (not cash)", MONEY.format(s["decimo_accrued"]))
+        n.metric("Vacation paid", MONEY.format(s["vacation"]))
+        o.metric("Pass-through loans", MONEY.format(s["loans"]))
+
+        if s["decimo_paid"] > 0:
+            st.warning(
+                "This period includes decimo (13th month) of "
+                f"{MONEY.format(s['decimo_paid'])}. Decimo is paid on 15 April, "
+                "15 August, and 15 December, so it is excluded from the recurring "
+                "payroll figure below and tracked as its own cash line."
+            )
+
         st.subheader("By employee group")
         groups = by_group(df)
         money_table(groups)
@@ -163,7 +184,6 @@ elif page == "Payroll":
             st.write("No loan deductions in this period.")
         else:
             money_table(loans)
-            st.metric("Total pass-through deductions", MONEY.format(s["loans"]))
 
         with st.expander("Employee detail"):
             cols = [c for c in ["NOMBRE", "CARGO", "GRUPO", "SALARIO_MENSUAL",
@@ -180,16 +200,29 @@ elif page == "Payroll":
 
         st.divider()
         st.subheader("Send to Cash Flow")
-        st.caption("This period is one quincena, so the monthly figures are double these amounts.")
-        monthly_payroll = s["net"] * 2
+        st.caption(
+            "This period is one quincena, so recurring monthly figures are double the "
+            "period amount. Decimo is not doubled: it is sent as a separate three-times-"
+            "a-year payment."
+        )
+        recurring_net = s["net"] - s["decimo_paid"]
+        monthly_payroll = recurring_net * 2
         monthly_css = (s["employer_cost"] + s["employee_statutory"]) * 2
-        i, j = st.columns(2)
+        i, j, k2 = st.columns(3)
         i.metric("Monthly payroll cash", MONEY.format(monthly_payroll))
         j.metric("Monthly CSS / government", MONEY.format(monthly_css))
+        k2.metric("Decimo per payment", MONEY.format(s["decimo_paid"]))
+        send_decimo = st.checkbox(
+            "Also update the decimo amount",
+            value=s["decimo_paid"] > 0,
+            help="Only tick this when the uploaded period actually contains decimo.",
+        )
         if st.button("Update my Cash Flow numbers"):
             saved = load_settings()
             saved["payroll"] = round(monthly_payroll, 2)
             saved["css"] = round(monthly_css, 2)
+            if send_decimo:
+                saved["decimo"] = round(s["decimo_paid"], 2)
             save_settings(saved)
             st.success("Cash Flow updated. Open the Cash Flow page to see the effect.")
 
@@ -227,6 +260,9 @@ elif page == "Cash Flow":
                                      value=float(saved["pluxee"]), step=100.0)
             viatico = st.number_input("Viatico — 15th ($)", min_value=0.0,
                                       value=float(saved["viatico"]), step=100.0)
+            decimo = st.number_input(
+                "Decimo — 15 Apr, 15 Aug, 15 Dec ($ per payment)", min_value=0.0,
+                value=float(saved.get("decimo", 0.0)), step=1000.0)
             fixed = st.number_input("All other fixed expenses ($)", min_value=0.0,
                                     value=float(saved["fixed"]), step=500.0)
 
@@ -243,6 +279,7 @@ elif page == "Cash Flow":
         "css": css,
         "pluxee": pluxee,
         "viatico": viatico,
+        "decimo": decimo,
         "fixed": fixed,
     }
 
@@ -269,8 +306,7 @@ elif page == "Cash Flow":
         st.line_chart(df.set_index("Date")["Balance"])
 
         view = st.radio("Detail view", ["30 days", "90 days"], horizontal=True)
-        table = d30 if view == "90 days" else d30
-        table = (df if view == "90 days" else d30)
+        table = df if view == "90 days" else d30
         table = table[table["Net"] != 0]
         st.dataframe(
             table.style.format({c: MONEY for c in table.columns if c != "Date"}),
