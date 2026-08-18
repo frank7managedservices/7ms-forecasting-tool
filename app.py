@@ -16,13 +16,21 @@ DEFAULTS = {
     "start_cash": 0.0,
     "revenue": 0.0,
     "revenue_mode": "Spread evenly",
-    "revenue_day": 10,
+    "revenue_day": 20,
+    "horizon": 120,
     "payroll": 0.0,
     "css": 0.0,
     "pluxee": 0.0,
     "viatico": 0.0,
     "decimo": 0.0,
     "fixed": 0.0,
+    "loc_limit": 0.0,
+    "loc_drawn": 0.0,
+    "loc_rate": 0.0,
+    "loc_auto": True,
+    "loc_min_cash": 0.0,
+    "loc_draw_amount": 0.0,
+    "loc_draw_day": str(date.today()),
 }
 
 MONEY = "${:,.2f}"
@@ -411,9 +419,29 @@ def is_last_day(d):
 
 
 def build_schedule(s, horizon, severance=None):
+    """Day-by-day cash projection.
+
+    The line of credit works two ways at once. A one-time draw lands on the
+    date you pick. On top of that, if automatic draws are on, the model pulls
+    whatever it needs on any day cash would otherwise fall below your minimum,
+    up to the credit limit. Interest is charged in cash at month end on the
+    outstanding balance, and draws are treated as cash in, not revenue.
+    """
     severance = severance or {}
     start = date.today()
     balance = s["start_cash"]
+
+    loc_limit = float(s.get("loc_limit", 0.0))
+    loc_balance = float(s.get("loc_drawn", 0.0))
+    loc_rate = float(s.get("loc_rate", 0.0)) / 100.0
+    loc_auto = bool(s.get("loc_auto", False))
+    loc_min_cash = float(s.get("loc_min_cash", 0.0))
+    loc_draw_amount = float(s.get("loc_draw_amount", 0.0))
+    try:
+        loc_draw_day = date.fromisoformat(str(s.get("loc_draw_day"))[:10])
+    except Exception:
+        loc_draw_day = None
+
     rows = []
     for i in range(horizon):
         d = start + timedelta(days=i)
@@ -432,13 +460,34 @@ def build_schedule(s, horizon, severance=None):
         fixed_out = s["fixed"] / dim
         sev_out = severance.get(d, 0.0)
 
+        # Interest on the line of credit is paid in cash at month end.
+        interest = loc_balance * loc_rate / 12 if (is_last_day(d) and loc_rate) else 0.0
+
         out = (pay + css_out + pluxee_out + viatico_out + decimo_out
-               + sev_out + fixed_out)
-        balance += collections - out
+               + sev_out + fixed_out + interest)
+
+        draw = 0.0
+        available = max(loc_limit - loc_balance, 0.0)
+        if loc_draw_day is not None and d == loc_draw_day and loc_draw_amount > 0:
+            draw += min(loc_draw_amount, available)
+            available -= draw
+
+        projected = balance + collections - out + draw
+        if loc_auto and available > 0 and projected < loc_min_cash:
+            need = loc_min_cash - projected
+            # Draw in round thousands, the way a bank transfer actually happens.
+            need = -(-need // 1000) * 1000
+            extra = min(need, available)
+            draw += extra
+            available -= extra
+
+        loc_balance += draw
+        balance += collections - out + draw
 
         rows.append({
             "Date": d,
             "Collections": collections,
+            "Credit Draw": draw,
             "Payroll": pay,
             "CSS / Government": css_out,
             "Pluxee": pluxee_out,
@@ -446,10 +495,26 @@ def build_schedule(s, horizon, severance=None):
             "Decimo": decimo_out,
             "Severance": sev_out,
             "Other Fixed": fixed_out,
-            "Net": collections - out,
+            "Interest": interest,
+            "Net": collections + draw - out,
             "Balance": balance,
+            "Credit Balance": loc_balance,
+            "Credit Available": max(loc_limit - loc_balance, 0.0),
         })
     return pd.DataFrame(rows)
+
+
+def monthly_summary(df):
+    """Roll the daily schedule up by calendar month."""
+    out = df.copy()
+    out["Month"] = pd.to_datetime(out["Date"]).dt.strftime("%Y-%m")
+    cols = ["Collections", "Credit Draw", "Payroll", "CSS / Government", "Pluxee",
+            "Viatico", "Decimo", "Severance", "Other Fixed", "Interest", "Net"]
+    g = out.groupby("Month", as_index=False)[cols].sum()
+    g["Ending Balance"] = out.groupby("Month")["Balance"].last().values
+    g["Credit Balance"] = out.groupby("Month")["Credit Balance"].last().values
+    g["Days Counted"] = out.groupby("Month")["Date"].size().values
+    return g
 
 
 def money_table(df):
@@ -615,19 +680,27 @@ if page == "Dashboard":
     st.write("Overview of forecast vs actual, cash position, and payroll.")
     saved = load_settings()
     sev = scheduled_payments(load_terminations())
-    df = build_schedule(saved, 90, sev)
+    days = int(saved.get("horizon", 120))
+    df = build_schedule(saved, days, sev)
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Cash on hand", MONEY.format(saved["start_cash"]))
-    c2.metric("Balance in 30 days", MONEY.format(df["Balance"].iloc[29]))
-    c3.metric("Balance in 90 days", MONEY.format(df["Balance"].iloc[-1]))
+    c2.metric("Balance in 30 days", MONEY.format(df["Balance"].iloc[min(29, days - 1)]))
+    c3.metric(f"Balance in {days} days", MONEY.format(df["Balance"].iloc[-1]))
     c4.metric("Payroll this month", MONEY.format(saved["payroll"]))
     st.caption(
         "Decimo per payment: " + MONEY.format(saved.get("decimo", 0.0))
         + "  ·  paid 15 April, 15 August, 15 December"
     )
+    if saved.get("loc_limit", 0.0) > 0:
+        drawn_end = df["Credit Balance"].iloc[-1]
+        st.caption(
+            "Line of credit: " + MONEY.format(drawn_end) + " owed at day "
+            + str(days) + " of " + MONEY.format(saved["loc_limit"]) + " limit  ·  "
+            + MONEY.format(df["Credit Draw"].sum()) + " drawn in this window"
+        )
     due = df["Severance"].sum()
     if due:
-        st.warning(f"Severance due in the next 90 days: {MONEY.format(due)}")
+        st.warning(f"Severance due in the next {days} days: {MONEY.format(due)}")
     st.line_chart(df.set_index("Date")["Balance"])
 
 elif page == "Forecast":
@@ -1221,6 +1294,10 @@ elif page == "Cash Flow":
             )
             revenue_day = st.number_input("Collection day of month", 1, 31,
                                           int(saved["revenue_day"]))
+            horizon = st.number_input(
+                "Days to project", 30, 730, int(saved.get("horizon", 120)), step=30,
+                help="90 days stops mid-month, which can cut off the last "
+                     "collection. 120 or more gives you whole months.")
 
         with b:
             st.subheader("Cash Out (monthly totals)")
@@ -1238,6 +1315,45 @@ elif page == "Cash Flow":
             fixed = st.number_input("All other fixed expenses ($)", min_value=0.0,
                                     value=float(saved["fixed"]), step=500.0)
 
+        st.subheader("Line of Credit")
+        st.caption(
+            "A draw is cash in, not revenue, so it is tracked separately and adds "
+            "to what you owe. Interest is charged in cash at month end on the "
+            "outstanding balance."
+        )
+        l1, l2, l3 = st.columns(3)
+        with l1:
+            loc_limit = st.number_input("Credit limit ($)", min_value=0.0,
+                                        value=float(saved.get("loc_limit", 0.0)),
+                                        step=10000.0)
+            loc_drawn = st.number_input("Already drawn today ($)", min_value=0.0,
+                                        value=float(saved.get("loc_drawn", 0.0)),
+                                        step=5000.0)
+        with l2:
+            loc_rate = st.number_input("Annual interest rate (%)", min_value=0.0,
+                                       value=float(saved.get("loc_rate", 0.0)),
+                                       step=0.25)
+            loc_min_cash = st.number_input(
+                "Keep cash above ($)", min_value=0.0,
+                value=float(saved.get("loc_min_cash", 0.0)), step=5000.0,
+                help="Automatic draws top the account back up to this floor.")
+        with l3:
+            loc_auto = st.checkbox("Draw automatically when cash runs short",
+                                   value=bool(saved.get("loc_auto", True)))
+            loc_draw_amount = st.number_input(
+                "One-time draw ($)", min_value=0.0,
+                value=float(saved.get("loc_draw_amount", 0.0)), step=5000.0,
+                help="A specific draw you already plan to take. Leave at zero "
+                     "if you only want automatic draws.")
+            try:
+                default_draw_day = date.fromisoformat(
+                    str(saved.get("loc_draw_day"))[:10])
+            except Exception:
+                default_draw_day = date.today()
+            loc_draw_day = st.date_input("One-time draw date",
+                                         value=default_draw_day,
+                                         min_value=date(2000, 1, 1))
+
         c1, c2 = st.columns(2)
         calculate = c1.form_submit_button("Calculate cash flow")
         store = c2.form_submit_button("Save these numbers")
@@ -1253,6 +1369,14 @@ elif page == "Cash Flow":
         "viatico": viatico,
         "decimo": decimo,
         "fixed": fixed,
+        "horizon": int(horizon),
+        "loc_limit": loc_limit,
+        "loc_drawn": loc_drawn,
+        "loc_rate": loc_rate,
+        "loc_auto": bool(loc_auto),
+        "loc_min_cash": loc_min_cash,
+        "loc_draw_amount": loc_draw_amount,
+        "loc_draw_day": str(loc_draw_day),
     }
 
     if store:
@@ -1261,24 +1385,81 @@ elif page == "Cash Flow":
 
     if calculate or store:
         sev = scheduled_payments(load_terminations())
-        df = build_schedule(current, 90, sev)
+        days = int(horizon)
+        df = build_schedule(current, days, sev)
         d30 = df.head(30)
 
         m1, m2, m3 = st.columns(3)
         m1.metric("Balance in 30 days", MONEY.format(d30["Balance"].iloc[-1]))
-        m2.metric("Balance in 90 days", MONEY.format(df["Balance"].iloc[-1]))
+        m2.metric(f"Balance in {days} days", MONEY.format(df["Balance"].iloc[-1]))
         low = df.loc[df["Balance"].idxmin()]
-        m3.metric("Lowest balance (90d)", MONEY.format(low["Balance"]), str(low["Date"]))
+        m3.metric(f"Lowest balance ({days}d)", MONEY.format(low["Balance"]),
+                  str(low["Date"]))
+
+        collections_total = df["Collections"].sum()
+        payments = int((df["Collections"] > 0).sum()) if current["revenue_mode"] != "Spread evenly" else 0
+        if current["revenue_mode"] == "Spread evenly":
+            st.caption(
+                f"Collections of {MONEY.format(current['revenue'])} per month spread "
+                f"daily, {MONEY.format(collections_total)} over {days} days."
+            )
+        else:
+            st.caption(
+                f"Collections of {MONEY.format(current['revenue'])} land on day "
+                f"{int(current['revenue_day'])} of each month, {payments} payment(s) "
+                f"totalling {MONEY.format(collections_total)} in this window. A "
+                "window that ends before that day in the final month will not "
+                "include that month's payment."
+            )
+
+        drawn_window = df["Credit Draw"].sum()
+        end_credit = df["Credit Balance"].iloc[-1]
+        interest_total = df["Interest"].sum()
+        if loc_limit > 0:
+            k1, k2, k3 = st.columns(3)
+            k1.metric("Drawn in this window", MONEY.format(drawn_window))
+            k2.metric("Credit owed at the end", MONEY.format(end_credit))
+            k3.metric("Credit still available",
+                      MONEY.format(max(loc_limit - end_credit, 0.0)))
+            st.caption(f"Interest paid in this window: "
+                       + MONEY.format(interest_total))
+            first_draw = df[df["Credit Draw"] > 0]
+            if not first_draw.empty:
+                st.info(
+                    "First draw needed on "
+                    f"{first_draw['Date'].iloc[0]} for "
+                    + MONEY.format(first_draw["Credit Draw"].iloc[0])
+                )
+            if end_credit >= loc_limit - 0.01 and loc_limit > 0:
+                st.error(
+                    "The line of credit is fully drawn before the end of this "
+                    "window. Cash beyond that point has nothing left to fall "
+                    "back on."
+                )
 
         if low["Balance"] < 0:
-            st.error(f"Cash goes negative on {low['Date']}. Review collections timing or expenses.")
+            st.error(f"Cash goes negative on {low['Date']}. "
+                     "The line of credit cannot cover the gap.")
+        elif drawn_window > 0:
+            st.warning(
+                f"Cash stays positive for the full {days} days, but only by "
+                f"drawing {MONEY.format(drawn_window)} on the line of credit."
+            )
         else:
-            st.success("Cash stays positive for the full 90 days.")
+            st.success(f"Cash stays positive for the full {days} days with no "
+                       "draw on the line of credit.")
 
         st.subheader("Projected balance")
         st.line_chart(df.set_index("Date")["Balance"])
 
-        view = st.radio("Detail view", ["30 days", "90 days"], horizontal=True)
+        st.subheader("Month by month")
+        st.caption(
+            "The first and last months may be partial, since the projection starts "
+            "today. Check Days Counted."
+        )
+        money_table(monthly_summary(df))
+
+        view = st.radio("Detail view", ["30 days", f"{days} days"], horizontal=True)
         table = d30 if view == "30 days" else df
         table = table[table["Net"] != 0]
         st.dataframe(
