@@ -97,9 +97,10 @@ def read_payroll(file_like, name=""):
         df["GRUPO"] = "Other / Unmapped"
         df["CARGO_LIMPIO"] = ""
 
-        if "ID_EMP" in df.columns:
+    if "ID_EMP" in df.columns:
         ids = df["ID_EMP"].astype(str).str.split(".").str[0].str.strip()
         df["GRUPO"] = [EMPLOYEE_OVERRIDES.get(i, g) for i, g in zip(ids, df["GRUPO"])]
+
     if "NOMBRE" in df.columns:
         df["NOMBRE"] = df["NOMBRE"].astype(str).str.replace(r"\s+", " ", regex=True).str.strip()
 
