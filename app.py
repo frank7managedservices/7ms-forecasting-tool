@@ -1094,12 +1094,31 @@ elif page == "Payroll":
     per_month = period_choices[picked]
     st.caption(
         f"Multiplier in use: {per_month:g}. Net pay in this file is "
-        + MONEY.format(s["net"]) + ", so monthly payroll cash is "
-        + MONEY.format(s["net"] * per_month) + "."
+        + MONEY.format(s["net"]) + ". Regular pay after taking out one-off "
+        "decimo and liquidacion payouts is "
+        + MONEY.format(s["net"] - one_off) + ", so monthly payroll cash is "
+        + MONEY.format(monthly_payroll) + "."
     )
+    if one_off > 0:
+        st.warning(
+            "This period includes "
+            + MONEY.format(tot_early["decimo_cash"]) + " of decimo paid and "
+            + MONEY.format(tot_early["liquidacion_cash"])
+            + " of liquidacion. Those are one-off payments, so they are left "
+            "out of the monthly payroll figure. Decimo has its own line, and "
+            "terminations belong on the Terminations page. Leaving them in and "
+            "multiplying would create cash that never actually leaves."
+        )
 
-    monthly_payroll = s["net"] * per_month
-    monthly_css = (s["employer_cost"] + s["employee_statutory"]) * per_month
+    tot_early = payroll.accrual_totals(df)
+    # A period that lands on 15 April, August or December carries the decimo
+    # payment inside net pay, and a period with terminations carries the
+    # liquidacion. Doubling either one invents cash that will never go out, so
+    # both are stripped out here and tracked on their own lines instead.
+    one_off = tot_early["decimo_cash"] + tot_early["liquidacion_cash"]
+    monthly_payroll = (s["net"] - one_off) * per_month
+    monthly_css = (s["employer_cost"] + s["employee_statutory"]
+                   - tot_early["isr_on_liquidacion"]) * per_month
     monthly_viatico = s["viatico"] * per_month
     # Decimo is one month of pay a year paid in three installments, so each
     # installment covers four months of accrual.
@@ -1187,13 +1206,12 @@ elif page == "Payroll":
             + MONEY.format(decimo_provision) + " and vacation provision "
             + MONEY.format(vacation_provision) + " per month."
         )
-    st.info(
-        "One caution on cash basis: net pay already contains "
-        + MONEY.format(tot["decimo_cash"] * per_month)
-        + " a month of decimo advances paid through the planilla. If you also "
-        "charge the full decimo lump, that much is counted twice. Reduce the "
-        "decimo figure on the Cash Flow page if these advances are common."
-    )
+    if tot["liquidacion_cash"] > 0:
+        st.info(
+            "This period paid " + MONEY.format(tot["liquidacion_cash"])
+            + " of liquidacion. Add those on the Terminations page so they "
+            "land on the date each one is actually due."
+        )
 
     st.divider()
     st.subheader("Save this period")

@@ -230,6 +230,10 @@ def accrual_breakdown(df, per_month=2.0):
     return out[out["This period"] != 0]
 
 
+def col_isr_liq(df):
+    return col(df, "DED_ISR_LIQ").sum()
+
+
 def accrual_totals(df):
     """Headline accrued and benefit-cash figures for one period."""
     accrued = {label: _total(df, c) for label, c in ACCRUED_LINES}
@@ -243,6 +247,7 @@ def accrual_totals(df):
         "indem_accrued": float(accrued["Indemnizacion provision"]),
         "vacation_cash": float(benefit_cash["Vacation paid out"]),
         "decimo_cash": float(benefit_cash["Decimo paid in this period"]),
+        "isr_on_liquidacion": float(col_isr_liq(df)),
         "liquidacion_cash": float(
             benefit_cash["Prima de antiguedad paid"]
             + benefit_cash["Preaviso paid"]
