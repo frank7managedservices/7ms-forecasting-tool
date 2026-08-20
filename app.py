@@ -422,22 +422,125 @@ def save_settings(values):
 # each expense costs and the day of the month it actually leaves the bank.
 # ---------------------------------------------------------------------------
 
-EXPENSE_COLUMNS = ["Expense", "Monthly amount", "Day of month"]
+EXPENSE_COLUMNS = ["Expense", "Monthly amount", "Day of month",
+                   "Starts", "Ends", "Flexible"]
 REVENUE_COLUMNS = ["Month", "Expected collections", "Day of month"]
 
 
 def load_expense_schedule():
+    """Expense lines, widened for effective dates and payment flexibility.
+
+    Rows saved before those columns existed come back with blank dates, which
+    means always active, and Flexible false, which means never move it.
+    """
     rows = kv_get("expense_schedule")
     if isinstance(rows, list) and rows:
-        return pd.DataFrame(rows)[EXPENSE_COLUMNS]
+        frame = pd.DataFrame(rows)
+        for c in ("Starts", "Ends"):
+            if c not in frame.columns:
+                frame[c] = ""
+            frame[c] = frame[c].fillna("").astype(str).str.strip()
+        if "Flexible" not in frame.columns:
+            frame["Flexible"] = False
+        frame["Flexible"] = frame["Flexible"].fillna(False).astype(bool)
+        return frame[EXPENSE_COLUMNS]
     return pd.DataFrame(columns=EXPENSE_COLUMNS)
 
 
 def save_expense_schedule(frame):
     frame = frame.dropna(subset=["Expense"])
-    frame = frame[frame["Expense"].astype(str).str.strip() != ""]
-    kv_put("expense_schedule", frame.to_dict("records"))
+    frame = frame[frame["Expense"].astype(str).str.strip() != ""].copy()
+    for c in ("Starts", "Ends"):
+        if c not in frame.columns:
+            frame[c] = ""
+        frame[c] = frame[c].fillna("").astype(str).str.strip()
+    if "Flexible" not in frame.columns:
+        frame["Flexible"] = False
+    frame["Flexible"] = frame["Flexible"].fillna(False).astype(bool)
+    kv_put("expense_schedule", frame[EXPENSE_COLUMNS].to_dict("records"))
     return frame
+
+
+def month_label(d):
+    return f"{d.year:04d}-{d.month:02d}"
+
+
+def normalise_month(value):
+    """Accept 2026-10, 2026/10, 10-2026, or a full date. Blank means open."""
+    text = str(value or "").strip()
+    if not text or text.lower() in ("nan", "none", "nat"):
+        return ""
+    text = text.replace("/", "-")
+    parts = [x for x in text.split("-") if x]
+    try:
+        if len(parts) >= 2 and len(parts[0]) == 4:
+            return f"{int(parts[0]):04d}-{int(parts[1]):02d}"
+        if len(parts) >= 2 and len(parts[-1]) == 4:
+            return f"{int(parts[-1]):04d}-{int(parts[0]):02d}"
+    except Exception:
+        return ""
+    return ""
+
+
+def expense_active(row, label):
+    """Is this line in force in the given YYYY-MM month?"""
+    starts = normalise_month(row.get("Starts", ""))
+    ends = normalise_month(row.get("Ends", ""))
+    if starts and label < starts:
+        return False
+    if ends and label > ends:
+        return False
+    return True
+
+
+def expense_due_map(expenses, label):
+    """Day of month to amount, for the lines in force that month.
+
+    Returns two dicts: everything due, and the flexible part of it.
+    """
+    due, flex = {}, {}
+    if expenses is None or expenses.empty:
+        return due, flex
+    for _, r in expenses.iterrows():
+        if not expense_active(r, label):
+            continue
+        try:
+            day = max(1, min(int(r["Day of month"]), 31))
+            amount = float(r["Monthly amount"])
+        except Exception:
+            continue
+        due[day] = due.get(day, 0.0) + amount
+        if bool(r.get("Flexible", False)):
+            flex[day] = flex.get(day, 0.0) + amount
+    return due, flex
+
+
+def flexible_between(expenses, start, end):
+    """Flexible lines falling due between two dates, with their dates."""
+    rows = []
+    if expenses is None or expenses.empty:
+        return pd.DataFrame(columns=["Date", "Expense", "Amount"])
+    d = start
+    while d <= end:
+        label = month_label(d)
+        dim = calendar.monthrange(d.year, d.month)[1]
+        for _, r in expenses.iterrows():
+            if not expense_active(r, label):
+                continue
+            if not bool(r.get("Flexible", False)):
+                continue
+            try:
+                day = max(1, min(int(r["Day of month"]), 31))
+                amount = float(r["Monthly amount"])
+            except Exception:
+                continue
+            lands = min(day, dim)
+            if lands == d.day:
+                rows.append({"Date": d.isoformat(),
+                             "Expense": str(r["Expense"]),
+                             "Amount": amount})
+        d += timedelta(days=1)
+    return pd.DataFrame(rows)
 
 
 def load_revenue_schedule():
@@ -619,15 +722,16 @@ def build_schedule(s, horizon, severance=None, expenses=None, revenues=None,
         str(s.get("expense_mode", "")).lower().startswith("use")
         and expenses is not None and not expenses.empty
     )
-    if use_expense_schedule:
-        due = {}
-        for _, r in expenses.iterrows():
-            try:
-                day = int(r["Day of month"])
-                amount = float(r["Monthly amount"])
-            except Exception:
-                continue
-            due[max(1, min(day, 31))] = due.get(max(1, min(day, 31)), 0.0) + amount
+    # Expense lines can start and stop, so the map of what is due has to be
+    # worked out per month rather than once for the whole projection. A cost
+    # cut taking effect in October must not reduce August.
+    due_cache = {}
+
+    def due_for(d):
+        key = (d.year, d.month)
+        if key not in due_cache:
+            due_cache[key] = expense_due_map(expenses, month_label(d))
+        return due_cache[key]
 
     mode_word = str(s.get("revenue_mode", "")).lower()
     by_month = (
@@ -693,6 +797,7 @@ def build_schedule(s, horizon, severance=None, expenses=None, revenues=None,
             provision = 0.0
 
         if use_expense_schedule:
+            due, _flex = due_for(d)
             fixed_out = due.get(min(d.day, dim), 0.0)
             # Anything due after the last day of a short month lands on that day.
             if d.day == dim:
@@ -1189,6 +1294,55 @@ if page == "Dashboard":
             + MONEY.format(limit) + ". Peak draw across the window: "
             + MONEY.format(float(df["Credit Balance"].max())) + "."
         )
+
+    # ---- tight days, and what you could delay ----------------------------
+    tight = df[df["Balance"] < float(saved.get("loc_min_cash", 0.0))]
+    if not tight.empty:
+        st.divider()
+        st.subheader("Tight days, and what you could delay")
+        exp_frame = load_expense_schedule()
+        first_tight = pd.to_datetime(tight.iloc[0]["Date"]).date()
+        last_tight = pd.to_datetime(tight.iloc[-1]["Date"]).date()
+        st.caption(
+            str(len(tight)) + " day(s) fall below your minimum cash of "
+            + MONEY.format(float(saved.get("loc_min_cash", 0.0)))
+            + ", from " + first_tight.isoformat() + " to "
+            + last_tight.isoformat() + "."
+        )
+        # Look at the fortnight running up to the squeeze, since a bill paid
+        # just before it is the one worth holding back.
+        look_from = first_tight - timedelta(days=14)
+        flex = flexible_between(exp_frame, look_from, last_tight)
+        if flex.empty:
+            st.info(
+                "No lines are marked flexible in that window. Tick Flexible on "
+                "the Cash Flow page for any bill you could pay late, typically "
+                "net 30 terms, and it will show up here."
+            )
+        else:
+            money_table(flex)
+            st.metric("Flexible in that window",
+                      MONEY.format(float(flex["Amount"].sum())))
+            worst = float(tight["Balance"].min())
+            need = max(-worst, 0.0) if worst < 0 else 0.0
+            if need and float(flex["Amount"].sum()) >= need:
+                st.success(
+                    "Delaying " + MONEY.format(need) + " of those bills past "
+                    "the squeeze would keep you above zero. There is "
+                    + MONEY.format(float(flex["Amount"].sum()))
+                    + " of flexible spend in the window, so it is coverable."
+                )
+            elif need:
+                st.warning(
+                    "The shortfall is " + MONEY.format(need)
+                    + " but only " + MONEY.format(float(flex["Amount"].sum()))
+                    + " in that window is flexible. Delaying alone will not "
+                    "close it."
+                )
+            st.caption(
+                "Nothing has been moved. This is only what is available to "
+                "move, and which days it currently sits on."
+            )
 
     st.divider()
 
@@ -2252,17 +2406,65 @@ elif page == "Cash Flow":
                 "last day instead. This is only used when the timing above is "
                 "set to the due-date schedule."
             )
+            st.caption(
+                "Starts and Ends control when a line is in force, written as "
+                "2026-10. Leave them blank for always. To cut a cost from "
+                "October, put 2026-09 in Ends on the old row and add a new row "
+                "at the lower amount starting 2026-10. The months before the "
+                "change keep the old figure, which is what makes the history "
+                "honest."
+            )
+            st.caption(
+                "Flexible marks a bill you could pay late without trouble, "
+                "typically anything on net 30 terms. Nothing is moved "
+                "automatically. It is only used to show you which bills sit in "
+                "a tight week, on the Dashboard."
+            )
             expense_rows = st.data_editor(
                 saved_expenses if not saved_expenses.empty else
                 pd.DataFrame([
-                    {"Expense": "Rent", "Monthly amount": 0.0, "Day of month": 5},
-                    {"Expense": "Utilities", "Monthly amount": 0.0, "Day of month": 10},
-                    {"Expense": "Insurance", "Monthly amount": 0.0, "Day of month": 15},
-                    {"Expense": "Everything else", "Monthly amount": 0.0, "Day of month": 25},
+                    {"Expense": "Rent", "Monthly amount": 0.0, "Day of month": 5,
+                     "Starts": "", "Ends": "", "Flexible": False},
+                    {"Expense": "Utilities", "Monthly amount": 0.0, "Day of month": 10,
+                     "Starts": "", "Ends": "", "Flexible": False},
+                    {"Expense": "Insurance", "Monthly amount": 0.0, "Day of month": 15,
+                     "Starts": "", "Ends": "", "Flexible": False},
+                    {"Expense": "Everything else", "Monthly amount": 0.0, "Day of month": 25,
+                     "Starts": "", "Ends": "", "Flexible": False},
                 ]),
                 num_rows="dynamic", use_container_width=True, hide_index=True,
                 key="expense_editor",
+                column_config={
+                    "Monthly amount": st.column_config.NumberColumn(
+                        "Monthly amount", format="$%.2f", min_value=0.0),
+                    "Day of month": st.column_config.NumberColumn(
+                        "Day of month", min_value=1, max_value=31, step=1),
+                    "Starts": st.column_config.TextColumn(
+                        "Starts", help="First month this applies, as 2026-10. "
+                                       "Blank means from the beginning."),
+                    "Ends": st.column_config.TextColumn(
+                        "Ends", help="Last month this applies, as 2026-09. "
+                                     "Blank means it never stops."),
+                    "Flexible": st.column_config.CheckboxColumn(
+                        "Flexible", help="Tick if you could pay this late "
+                                         "without consequence, such as net 30 "
+                                         "terms."),
+                },
             )
+            active_now = saved_expenses[
+                saved_expenses.apply(
+                    lambda r: expense_active(r, month_label(date.today())),
+                    axis=1)] if not saved_expenses.empty else saved_expenses
+            if not saved_expenses.empty:
+                e1, e2, e3 = st.columns(3)
+                e1.metric("Lines in force this month", str(len(active_now)))
+                e2.metric("Due this month", MONEY.format(
+                    pd.to_numeric(active_now["Monthly amount"],
+                                  errors="coerce").fillna(0.0).sum()))
+                flex_sum = pd.to_numeric(
+                    active_now[active_now["Flexible"] == True]["Monthly amount"],
+                    errors="coerce").fillna(0.0).sum() if not active_now.empty else 0.0
+                e3.metric("Of that, flexible", MONEY.format(flex_sum))
 
         with st.expander("Revenue from agent hours"):
             st.caption(
