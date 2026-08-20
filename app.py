@@ -909,11 +909,158 @@ def gl_by_month(df):
     return g.sort_values("Month")
 
 
+# ---------------------------------------------------------------------------
+# Daily Log: what actually happened. A ledger of real transactions plus the
+# real bank balance typed off online banking. This never changes or replaces
+# the forecast. It sits beside it so the variance is visible.
+# ---------------------------------------------------------------------------
+
+LEDGER_COLUMNS = ["Date", "Description", "Category", "Money in", "Money out"]
+BANK_COLUMNS = ["Date", "Bank balance", "Note"]
+
+# The forecast columns an actual entry can be compared against. Anything that
+# is really a fixed expense line rolls up into Other Fixed, which is how the
+# forecast carries it.
+LEDGER_CATEGORIES = [
+    "Collections", "Other Revenue", "Credit Draw",
+    "Payroll", "CSS / Government", "Pluxee", "Viatico", "Decimo",
+    "Severance", "Other Fixed", "Interest", "Credit Payment", "Other",
+]
+
+MONEY_IN_CATEGORIES = {"Collections", "Other Revenue", "Credit Draw"}
+
+
+def category_choices():
+    """Forecast categories, plus each named line from the expense schedule."""
+    lines = []
+    try:
+        frame = load_expense_schedule()
+        if not frame.empty:
+            lines = [str(x).strip() for x in frame["Expense"].tolist()
+                     if str(x).strip()]
+    except Exception:
+        lines = []
+    seen, out = set(), []
+    for name in LEDGER_CATEGORIES + lines:
+        if name not in seen:
+            seen.add(name)
+            out.append(name)
+    return out
+
+
+def forecast_bucket(category):
+    """Map a ledger category onto the column the forecast reports it under."""
+    if category in LEDGER_CATEGORIES:
+        return category
+    return "Other Fixed"
+
+
+def load_ledger():
+    rows = kv_get("actuals_ledger")
+    if isinstance(rows, list) and rows:
+        frame = pd.DataFrame(rows)
+        for c in LEDGER_COLUMNS:
+            if c not in frame.columns:
+                frame[c] = "" if c in ("Description", "Category") else 0.0
+        return frame[LEDGER_COLUMNS]
+    return pd.DataFrame(columns=LEDGER_COLUMNS)
+
+
+def save_ledger(frame):
+    frame = frame.copy()
+    frame = frame.dropna(subset=["Date"])
+    frame["Date"] = frame["Date"].astype(str).str.slice(0, 10)
+    frame = frame[frame["Date"].str.strip() != ""]
+    for c in ("Money in", "Money out"):
+        frame[c] = pd.to_numeric(frame[c], errors="coerce").fillna(0.0)
+    frame = frame.sort_values("Date").reset_index(drop=True)
+    kv_put("actuals_ledger", frame[LEDGER_COLUMNS].to_dict("records"))
+    return frame
+
+
+def load_bank():
+    rows = kv_get("bank_balances")
+    if isinstance(rows, list) and rows:
+        frame = pd.DataFrame(rows)
+        for c in BANK_COLUMNS:
+            if c not in frame.columns:
+                frame[c] = "" if c == "Note" else 0.0
+        return frame[BANK_COLUMNS]
+    return pd.DataFrame(columns=BANK_COLUMNS)
+
+
+def save_bank(frame):
+    frame = frame.copy()
+    frame = frame.dropna(subset=["Date"])
+    frame["Date"] = frame["Date"].astype(str).str.slice(0, 10)
+    frame = frame[frame["Date"].str.strip() != ""]
+    frame["Bank balance"] = pd.to_numeric(
+        frame["Bank balance"], errors="coerce").fillna(0.0)
+    frame = frame.drop_duplicates(subset=["Date"], keep="last")
+    frame = frame.sort_values("Date").reset_index(drop=True)
+    kv_put("bank_balances", frame[BANK_COLUMNS].to_dict("records"))
+    return frame
+
+
+def ledger_running(frame, opening):
+    """Day by day: money in, money out, and the balance the ledger implies."""
+    if frame.empty:
+        return pd.DataFrame(columns=["Date", "Money in", "Money out", "Net",
+                                     "Balance"])
+    g = frame.copy()
+    g["Money in"] = pd.to_numeric(g["Money in"], errors="coerce").fillna(0.0)
+    g["Money out"] = pd.to_numeric(g["Money out"], errors="coerce").fillna(0.0)
+    g = g.groupby("Date", as_index=False)[["Money in", "Money out"]].sum()
+    g = g.sort_values("Date").reset_index(drop=True)
+    g["Net"] = g["Money in"] - g["Money out"]
+    g["Balance"] = float(opening) + g["Net"].cumsum()
+    return g
+
+
+def ledger_by_month(frame):
+    """Actuals rolled up by month and forecast bucket."""
+    if frame.empty:
+        return pd.DataFrame(columns=["Month", "Category", "Actual"])
+    g = frame.copy()
+    g["Month"] = g["Date"].astype(str).str.slice(0, 7)
+    g["Category"] = g["Category"].astype(str).map(forecast_bucket)
+    g["Money in"] = pd.to_numeric(g["Money in"], errors="coerce").fillna(0.0)
+    g["Money out"] = pd.to_numeric(g["Money out"], errors="coerce").fillna(0.0)
+    g["Actual"] = g.apply(
+        lambda r: r["Money in"] if r["Category"] in MONEY_IN_CATEGORIES
+        else r["Money out"], axis=1)
+    out = g.groupby(["Month", "Category"], as_index=False)["Actual"].sum()
+    return out
+
+
+def variance_table(actual_month, forecast_monthly, month):
+    """Forecast beside actual for one month, with the gap between them."""
+    fc = forecast_monthly[forecast_monthly["Month"] == month]
+    rows = []
+    for name in LEDGER_CATEGORIES:
+        if name in ("Other", "Credit Payment"):
+            continue
+        planned = float(fc[name].iloc[0]) if (not fc.empty
+                                             and name in fc.columns) else 0.0
+        got = actual_month[actual_month["Category"] == name]["Actual"]
+        real = float(got.iloc[0]) if not got.empty else 0.0
+        if not planned and not real:
+            continue
+        rows.append({"Category": name, "Forecast": planned, "Actual": real,
+                     "Difference": real - planned})
+    extra = actual_month[~actual_month["Category"].isin(LEDGER_CATEGORIES)]
+    for _, r in extra.iterrows():
+        rows.append({"Category": str(r["Category"]), "Forecast": 0.0,
+                     "Actual": float(r["Actual"]),
+                     "Difference": float(r["Actual"])})
+    return pd.DataFrame(rows)
+
+
 st.sidebar.title("7MS Forecasting Tool")
 page = st.sidebar.radio(
     "Go to",
     ["Dashboard", "Forecast", "Payroll", "Terminations", "Sage Actuals",
-     "Cash Flow", "AI Assistant"],
+     "Cash Flow", "Daily Log", "AI Assistant"],
 )
 
 storage_note()
@@ -2232,6 +2379,284 @@ elif page == "Cash Flow":
     if uploaded is not None:
         save_settings(json.load(uploaded))
         st.success("Restored. Refresh the page to see your numbers.")
+
+elif page == "Daily Log":
+    st.write(
+        "What actually happened, day by day. Log deposits and payments as they "
+        "hit, and type the real bank balance off your online banking. This page "
+        "never changes the forecast. It sits beside it so you can see where you "
+        "are running ahead or behind."
+    )
+
+    saved = load_settings()
+    ledger = load_ledger()
+    bank = load_bank()
+    choices = category_choices()
+
+    # -- reconcile the log against the bank ---------------------------------
+    # The earliest balance you typed is the anchor: it is taken as fact. From
+    # there the log is added up and compared against the most recent balance
+    # you typed. If the two disagree, something never made it into the log.
+    # Nothing is back-solved, or the check would always agree with itself.
+    bank_sorted = bank.sort_values("Date") if not bank.empty else bank
+    anchor_date, anchor_balance, real_balance, real_date = None, None, None, None
+    if not bank_sorted.empty:
+        first = bank_sorted.iloc[0]
+        anchor_date = str(first["Date"])[:10]
+        anchor_balance = float(first["Bank balance"])
+        last = bank_sorted.iloc[-1]
+        real_date = str(last["Date"])[:10]
+        real_balance = float(last["Bank balance"])
+
+    if anchor_date is None:
+        opening = float(saved.get("start_cash", 0.0))
+        counted = ledger
+    else:
+        opening = anchor_balance
+        counted = ledger[ledger["Date"].astype(str) > anchor_date]
+
+    running = ledger_running(counted, opening)
+    ledger_balance = float(running["Balance"].iloc[-1]) if not running.empty \
+        else opening
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Balance from the log", MONEY.format(ledger_balance),
+              help="Starts at the earliest bank balance you typed, then adds "
+                   "and subtracts everything logged after that date.")
+    if real_balance is None:
+        c2.metric("Bank says", "not entered")
+        c3.metric("Difference", "-")
+        st.info(
+            "The log is running off the starting balance from the Cash Flow "
+            "page, " + MONEY.format(opening) + ". Type a real bank balance "
+            "below and this becomes a proper reconciliation."
+        )
+    elif real_date == anchor_date:
+        c2.metric("Bank says", MONEY.format(real_balance))
+        c3.metric("Difference", "-")
+        st.info(
+            "Only one bank balance on file, from " + anchor_date + ", so "
+            "there is nothing to check it against yet. Type today's balance "
+            "and the two will be compared."
+        )
+    else:
+        c2.metric("Bank says", MONEY.format(real_balance),
+                  help="Your most recent typed balance, from " + real_date)
+        gap = real_balance - ledger_balance
+        c3.metric("Difference", MONEY.format(gap))
+        if abs(gap) >= 0.01:
+            st.warning(
+                "The log and the bank disagree by " + MONEY.format(gap)
+                + " as of " + real_date + ". "
+                + ("The bank holds more than the log explains, so a deposit is "
+                   "probably missing from the log."
+                   if gap > 0 else
+                   "The bank holds less than the log explains, so a payment, "
+                   "fee or transfer is probably missing from the log.")
+            )
+        else:
+            st.success("Log and bank agree as of " + real_date + ".")
+        st.caption(
+            "Anchored on " + MONEY.format(anchor_balance) + " at "
+            + anchor_date + ", plus everything logged after it."
+        )
+
+    st.divider()
+
+    # -- add one entry -------------------------------------------------------
+    st.subheader("Log something that happened")
+    with st.form("daily_entry", clear_on_submit=True):
+        f1, f2 = st.columns(2)
+        entry_date = f1.date_input("Date", value=date.today())
+        entry_cat = f2.selectbox("Category", choices)
+        entry_desc = st.text_input(
+            "Description", placeholder="Client X deposit, rent for August")
+        g1, g2 = st.columns(2)
+        amount_in = g1.number_input("Money in", min_value=0.0, step=100.0,
+                                    format="%.2f")
+        amount_out = g2.number_input("Money out", min_value=0.0, step=100.0,
+                                     format="%.2f")
+        added = st.form_submit_button("Add to the log")
+    if added:
+        if amount_in == 0.0 and amount_out == 0.0:
+            st.error("Enter an amount in or out.")
+        else:
+            ledger = save_ledger(pd.concat([ledger, pd.DataFrame([{
+                "Date": entry_date.isoformat(),
+                "Description": entry_desc,
+                "Category": entry_cat,
+                "Money in": float(amount_in),
+                "Money out": float(amount_out),
+            }])], ignore_index=True))
+            st.success("Logged. " + MONEY.format(
+                amount_in if amount_in else amount_out) + " "
+                + ("in" if amount_in else "out") + ".")
+            st.rerun()
+
+    st.subheader("Today's bank balance")
+    with st.form("bank_entry", clear_on_submit=True):
+        b1, b2 = st.columns(2)
+        bank_date = b1.date_input("As of", value=date.today(), key="bankdate")
+        bank_amount = b2.number_input("Balance in the account", step=100.0,
+                                      format="%.2f")
+        bank_note = st.text_input("Note", placeholder="optional")
+        saved_bank = st.form_submit_button("Save this balance")
+    if saved_bank:
+        bank = save_bank(pd.concat([bank, pd.DataFrame([{
+            "Date": bank_date.isoformat(),
+            "Bank balance": float(bank_amount),
+            "Note": bank_note,
+        }])], ignore_index=True))
+        st.success("Saved.")
+        st.rerun()
+
+    st.divider()
+
+    # -- the log itself ------------------------------------------------------
+    st.subheader("The log")
+    if ledger.empty:
+        st.info("Nothing logged yet. Add your first entry above.")
+    else:
+        edited = st.data_editor(
+            ledger, num_rows="dynamic", use_container_width=True,
+            hide_index=True, key="ledger_editor",
+            column_config={
+                "Date": st.column_config.TextColumn(
+                    "Date", help="YYYY-MM-DD"),
+                "Category": st.column_config.SelectboxColumn(
+                    "Category", options=choices),
+                "Money in": st.column_config.NumberColumn(
+                    "Money in", format="$%.2f", min_value=0.0),
+                "Money out": st.column_config.NumberColumn(
+                    "Money out", format="$%.2f", min_value=0.0),
+            },
+        )
+        if st.button("Save changes to the log"):
+            save_ledger(edited)
+            st.success("Saved.")
+            st.rerun()
+
+        tin = pd.to_numeric(ledger["Money in"], errors="coerce").fillna(0.0).sum()
+        tout = pd.to_numeric(ledger["Money out"], errors="coerce").fillna(0.0).sum()
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Logged in", MONEY.format(tin))
+        m2.metric("Logged out", MONEY.format(tout))
+        m3.metric("Net", MONEY.format(tin - tout))
+
+    if not bank.empty:
+        with st.expander("Bank balances you have typed"):
+            edited_bank = st.data_editor(
+                bank, num_rows="dynamic", use_container_width=True,
+                hide_index=True, key="bank_editor",
+                column_config={
+                    "Bank balance": st.column_config.NumberColumn(
+                        "Bank balance", format="$%.2f"),
+                },
+            )
+            if st.button("Save bank balances"):
+                save_bank(edited_bank)
+                st.success("Saved.")
+                st.rerun()
+
+    st.divider()
+
+    # -- forecast beside actual ---------------------------------------------
+    st.subheader("Forecast beside actual")
+    sev = scheduled_payments(load_terminations())
+    try:
+        target = date.fromisoformat(str(saved.get("end_date"))[:10])
+        days = max((target - date.today()).days + 1, 30)
+    except Exception:
+        days = int(saved.get("horizon", 120))
+    if saved.get("revenue_mode") == "Build from agent hours":
+        rev_frame = agent_revenue_schedule(
+            load_agent_schedule(), int(saved.get("revenue_day", 20)),
+            int(saved.get("revenue_lag", 0)))
+    else:
+        rev_frame = load_revenue_schedule()
+    plan = build_schedule(saved, days, sev, load_expense_schedule(),
+                          rev_frame, load_extra_revenue())
+    plan_monthly = monthly_summary(plan)
+
+    actual_monthly = ledger_by_month(ledger)
+    if actual_monthly.empty:
+        st.info(
+            "Once you have logged a few entries, this will show the forecast "
+            "for the month beside what really happened, line by line."
+        )
+    else:
+        months = sorted(set(actual_monthly["Month"]))
+        pick = st.selectbox("Month", months, index=len(months) - 1)
+        table = variance_table(
+            actual_monthly[actual_monthly["Month"] == pick],
+            plan_monthly, pick)
+        if table.empty:
+            st.info("Nothing to compare for that month yet.")
+        else:
+            money_table(table)
+            covered = plan_monthly[plan_monthly["Month"] == pick]
+            days_counted = int(covered["Days Counted"].iloc[0]) \
+                if not covered.empty else 0
+            month_len = calendar.monthrange(
+                int(pick[:4]), int(pick[5:7]))[1]
+            st.caption(
+                "Difference is actual less forecast. On a revenue line a "
+                "positive number is good. On an expense line a positive "
+                "number means you spent more than planned."
+            )
+            if 0 < days_counted < month_len:
+                st.warning(
+                    "Read this one carefully. The forecast only projects "
+                    "forward from today, so the forecast column for " + pick
+                    + " covers " + str(days_counted) + " of "
+                    + str(month_len) + " days, while your log may cover the "
+                    "whole month. Anything already paid before today sits in "
+                    "the actual column with no forecast beside it. The "
+                    "comparison is only apples to apples for a month that "
+                    "starts after today."
+                )
+
+        # Where the month is heading: real money so far, forecast for the rest.
+        month_rows = ledger[ledger["Date"].astype(str).str.slice(0, 7) == pick]
+        last_logged = str(month_rows["Date"].max())[:10] if not month_rows.empty \
+            else None
+        if last_logged:
+            rest = plan[pd.to_datetime(plan["Date"]).dt.strftime("%Y-%m-%d")
+                        > last_logged]
+            rest = rest[pd.to_datetime(rest["Date"]).dt.strftime("%Y-%m") == pick]
+            in_so_far = pd.to_numeric(
+                month_rows["Money in"], errors="coerce").fillna(0.0).sum()
+            out_so_far = pd.to_numeric(
+                month_rows["Money out"], errors="coerce").fillna(0.0).sum()
+            still_in = float(rest["Collections"].sum()
+                             + rest["Other Revenue"].sum()) if not rest.empty else 0.0
+            still_out = float(
+                rest["Payroll"].sum() + rest["CSS / Government"].sum()
+                + rest["Pluxee"].sum() + rest["Viatico"].sum()
+                + rest["Decimo"].sum() + rest["Severance"].sum()
+                + rest["Other Fixed"].sum() + rest["Interest"].sum()
+            ) if not rest.empty else 0.0
+            st.markdown("**Where this month lands**")
+            w1, w2, w3 = st.columns(3)
+            w1.metric("Logged so far", MONEY.format(in_so_far - out_so_far),
+                      help="Money in less money out, from the log only.")
+            w2.metric("Forecast for the rest",
+                      MONEY.format(still_in - still_out),
+                      help="From the day after your last entry to month end.")
+            w3.metric("Month should end at",
+                      MONEY.format((in_so_far - out_so_far)
+                                   + (still_in - still_out)))
+            st.caption(
+                "Actuals run through " + last_logged
+                + ". The rest comes from the forecast."
+            )
+
+    if not running.empty:
+        st.divider()
+        st.subheader("Actual balance over time")
+        st.line_chart(running.set_index("Date")["Balance"])
+        with st.expander("Day by day"):
+            money_table(running)
 
 elif page == "AI Assistant":
     st.write("Internal performance assistant.")
