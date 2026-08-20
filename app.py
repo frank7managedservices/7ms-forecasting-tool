@@ -1239,6 +1239,28 @@ elif page == "Payroll":
         help="If this file already covers a whole month, choose mensual so the "
              "figures are not doubled.")
     per_month = period_choices[picked]
+    tot_early = payroll.accrual_totals(df)
+    # A period that lands on 15 April, August or December carries the decimo
+    # payment inside net pay, and a period with terminations carries the
+    # liquidacion. Doubling either one invents cash that will never go out, so
+    # both are stripped out here and tracked on their own lines instead.
+    one_off = tot_early["decimo_cash"] + tot_early["liquidacion_cash"]
+    third = payroll.third_party_deductions(df)
+    include_third = st.checkbox(
+        "Include third party deductions in payroll cash", value=True,
+        help="These are the employee's own debts, funded out of their pay, but "
+             "the company writes the cheque to the cooperative or finance "
+             "company. Ticked, the cash leaves the bank. Unticked, it is "
+             "treated as the employee's affair and left out entirely.")
+    third_cash = third["remitted"] if include_third else 0.0
+    monthly_payroll = (s["net"] - one_off + third_cash) * per_month
+    monthly_css = (s["employer_cost"] + s["employee_statutory"]
+                   - tot_early["isr_on_liquidacion"]) * per_month
+    monthly_viatico = s["viatico"] * per_month
+    # Decimo is one month of pay a year paid in three installments, so each
+    # installment covers four months of accrual.
+    decimo_payment = s["decimo_accrued"] * per_month * 4
+
     st.caption(
         f"Multiplier in use: {per_month:g}. Net pay in this file is "
         + MONEY.format(s["net"]) + ". Take out one-off decimo and liquidacion "
@@ -1278,27 +1300,6 @@ elif page == "Payroll":
             "multiplying would create cash that never actually leaves."
         )
 
-    tot_early = payroll.accrual_totals(df)
-    # A period that lands on 15 April, August or December carries the decimo
-    # payment inside net pay, and a period with terminations carries the
-    # liquidacion. Doubling either one invents cash that will never go out, so
-    # both are stripped out here and tracked on their own lines instead.
-    one_off = tot_early["decimo_cash"] + tot_early["liquidacion_cash"]
-    third = payroll.third_party_deductions(df)
-    include_third = st.checkbox(
-        "Include third party deductions in payroll cash", value=True,
-        help="These are the employee's own debts, funded out of their pay, but "
-             "the company writes the cheque to the cooperative or finance "
-             "company. Ticked, the cash leaves the bank. Unticked, it is "
-             "treated as the employee's affair and left out entirely.")
-    third_cash = third["remitted"] if include_third else 0.0
-    monthly_payroll = (s["net"] - one_off + third_cash) * per_month
-    monthly_css = (s["employer_cost"] + s["employee_statutory"]
-                   - tot_early["isr_on_liquidacion"]) * per_month
-    monthly_viatico = s["viatico"] * per_month
-    # Decimo is one month of pay a year paid in three installments, so each
-    # installment covers four months of accrual.
-    decimo_payment = s["decimo_accrued"] * per_month * 4
 
     i, j = st.columns(2)
     i.metric("Monthly payroll cash", MONEY.format(monthly_payroll))
