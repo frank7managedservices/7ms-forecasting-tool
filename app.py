@@ -1162,6 +1162,502 @@ def variance_table(actual_month, forecast_monthly, month):
 
 
 # --------------------------------------------------------------------------
+# Assistant
+#
+# The rule this is built on: the model never does arithmetic. Every figure
+# comes out of build_schedule, the same engine behind the Dashboard. The model
+# explains, translates plain English into parameters, and drafts prose. To
+# catch it inventing a number anyway, every reply is audited against the
+# figures it was given.
+# --------------------------------------------------------------------------
+import re
+import urllib.error
+import urllib.request
+
+OPENAI_URL = "https://api.openai.com/v1/chat/completions"
+DEFAULT_MODEL = "gpt-5.6-luna"
+
+
+def assistant_key():
+    """The API key, from Streamlit secrets or the environment. Never the repo."""
+    try:
+        if "OPENAI_API_KEY" in st.secrets:
+            return str(st.secrets["OPENAI_API_KEY"]).strip()
+    except Exception:
+        pass
+    return str(os.environ.get("OPENAI_API_KEY", "")).strip()
+
+
+def assistant_model():
+    """Model names change every few months, so keep it a setting."""
+    try:
+        if "OPENAI_MODEL" in st.secrets:
+            return str(st.secrets["OPENAI_MODEL"]).strip()
+    except Exception:
+        pass
+    return str(os.environ.get("OPENAI_MODEL", "") or DEFAULT_MODEL).strip()
+
+
+def ask_model(system, user, want_json=False, timeout=90):
+    """One call to the API over plain HTTPS, so there is no extra dependency
+    to break on a redeploy. Returns (text, error)."""
+    key = assistant_key()
+    if not key:
+        return None, ("No API key is configured, so the plain-language part "
+                      "is switched off.")
+    payload = {
+        "model": assistant_model(),
+        "messages": [{"role": "system", "content": system},
+                     {"role": "user", "content": user}],
+    }
+    if want_json:
+        payload["response_format"] = {"type": "json_object"}
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        OPENAI_URL, data=body,
+        headers={"Content-Type": "application/json",
+                 "Authorization": "Bearer " + key})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            got = json.loads(resp.read().decode("utf-8"))
+        return got["choices"][0]["message"]["content"], None
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = json.loads(exc.read().decode("utf-8")) \
+                .get("error", {}).get("message", "")
+        except Exception:
+            pass
+        if exc.code == 401:
+            return None, ("The API key was refused. Check it is pasted "
+                          "correctly in Streamlit Secrets.")
+        if exc.code == 429:
+            return None, ("The account is out of credit or over its rate "
+                          "limit. Add credit in the OpenAI billing settings.")
+        if exc.code == 404:
+            return None, ("The model name " + assistant_model() + " was not "
+                          "found. Set OPENAI_MODEL in Streamlit Secrets to a "
+                          "model your account can use.")
+        return None, "The API returned an error: " + str(exc.code) + " " + detail
+    except Exception as exc:
+        return None, "Could not reach the API: " + str(exc)[:200]
+
+
+def assistant_facts(saved, df, monthly, expenses, ledger, bank):
+    """A compact, honest picture of the numbers. This is the only thing the
+    model ever sees, and every value in it was computed by this app."""
+    today = date.today()
+    label = month_label(today)
+    facts = {"today": today.isoformat(), "currency": "USD"}
+
+    low_idx = df["Balance"].idxmin()
+    low = df.loc[low_idx]
+    negative = df[df["Balance"] < 0]
+    facts["cash"] = {
+        "forecast_starts_from": round(float(saved.get("start_cash", 0.0)), 2),
+        "balance_in_30_days": round(float(
+            df["Balance"].iloc[min(29, len(df) - 1)]), 2),
+        "balance_at_end_of_window": round(float(df["Balance"].iloc[-1]), 2),
+        "window_days": int(len(df)),
+        "window_ends": str(df["Date"].iloc[-1])[:10],
+        "lowest_balance": round(float(low["Balance"]), 2),
+        "lowest_balance_date": str(low["Date"])[:10],
+        "days_below_zero": int(len(negative)),
+        "first_negative_date": (str(negative.iloc[0]["Date"])[:10]
+                                if not negative.empty else None),
+        "shortfall_at_lowest": round(max(-float(low["Balance"]), 0.0), 2),
+    }
+    if not bank.empty:
+        latest = bank.sort_values("Date").iloc[-1]
+        facts["cash"]["bank_balance"] = round(float(latest["Bank balance"]), 2)
+        facts["cash"]["bank_balance_date"] = str(latest["Date"])[:10]
+
+    limit = float(saved.get("loc_limit", 0.0))
+    if limit > 0:
+        fully = df[df["Credit Balance"] >= limit - 0.01]
+        facts["credit_line"] = {
+            "limit": round(limit, 2),
+            "already_drawn_today": round(float(saved.get("loc_drawn", 0.0)), 2),
+            "annual_rate_percent": round(float(saved.get("loc_rate", 0.0)), 2),
+            "peak_drawn_in_window": round(float(df["Credit Balance"].max()), 2),
+            "fully_drawn_from": (str(fully.iloc[0]["Date"])[:10]
+                                 if not fully.empty else None),
+            "minimum_cash_trigger": round(
+                float(saved.get("loc_min_cash", 0.0)), 2),
+        }
+
+    facts["monthly_obligations"] = {
+        "payroll": round(float(saved.get("payroll", 0.0)), 2),
+        "css_government": round(float(saved.get("css", 0.0)), 2),
+        "pluxee": round(float(saved.get("pluxee", 0.0)), 2),
+        "viatico": round(float(saved.get("viatico", 0.0)), 2),
+        "decimo_per_payment": round(float(saved.get("decimo", 0.0)), 2),
+        "decimo_paid_on": "15 April, 15 August and 15 December",
+        "accounting_basis": str(saved.get("basis", "")),
+    }
+
+    keep = ["Month", "Starting Balance", "Collections", "Other Revenue",
+            "Credit Draw", "Payroll", "CSS / Government", "Pluxee", "Viatico",
+            "Decimo", "Provisions", "Severance", "Other Fixed", "Interest",
+            "Net", "Ending Balance", "Credit Balance", "Days Counted"]
+    facts["by_month"] = [
+        {k: (round(float(v), 2) if isinstance(v, (int, float)) else v)
+         for k, v in row.items() if k in keep}
+        for row in monthly.to_dict("records")
+    ]
+
+    lines = []
+    if expenses is not None and not expenses.empty:
+        for _, r in expenses.iterrows():
+            lines.append({
+                "name": str(r["Expense"]),
+                "monthly_amount": round(float(r["Monthly amount"]), 2),
+                "due_day": int(r["Day of month"]),
+                "starts": normalise_month(r.get("Starts", "")) or None,
+                "ends": normalise_month(r.get("Ends", "")) or None,
+                "flexible": bool(r.get("Flexible", False)),
+                "in_force_this_month": bool(expense_active(r, label)),
+            })
+    facts["expense_lines"] = lines
+    facts["expense_timing_mode"] = str(saved.get("expense_mode", ""))
+
+    # This month, plan against what was actually recorded.
+    actual = ledger_by_month(ledger)
+    mine = (actual[actual["Month"] == label] if not actual.empty
+            else pd.DataFrame())
+    if not mine.empty:
+        var = variance_table(mine, monthly, label)
+        facts["this_month_variance"] = [
+            {"category": str(r["Category"]),
+             "forecast": round(float(r["Forecast"]), 2),
+             "actual": round(float(r["Actual"]), 2),
+             "difference": round(float(r["Difference"]), 2)}
+            for _, r in var.iterrows()
+        ]
+        covered = monthly[monthly["Month"] == label]
+        facts["this_month_forecast_covers_days"] = (
+            int(covered["Days Counted"].iloc[0]) if not covered.empty else 0)
+        facts["this_month_total_days"] = calendar.monthrange(
+            today.year, today.month)[1]
+    return facts
+
+
+NUMBER_RE = re.compile(r"-?\d[\d,]*\.?\d*")
+
+
+def allowed_numbers(facts):
+    """Every number the model is permitted to state, gathered from the facts."""
+    out = set()
+
+    def walk(node):
+        if isinstance(node, dict):
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+        elif isinstance(node, bool):
+            return
+        elif isinstance(node, (int, float)):
+            out.add(round(float(node), 2))
+            out.add(round(float(node)))
+        elif isinstance(node, str):
+            for m in NUMBER_RE.findall(node):
+                try:
+                    out.add(round(float(m.replace(",", "")), 2))
+                except Exception:
+                    pass
+    walk(facts)
+    return out
+
+
+def audit_numbers(text, allowed):
+    """Find figures in a reply that were not in the facts it was given.
+
+    Sums and differences are legitimate reasoning, so this is a prompt to
+    check rather than proof of an error. It has caught real inventions.
+    """
+    suspicious = []
+    for raw in NUMBER_RE.findall(str(text or "")):
+        try:
+            value = float(raw.replace(",", ""))
+        except Exception:
+            continue
+        if abs(value) < 100:
+            continue          # years, day numbers, percentages, small counts
+        if round(value, 2) in allowed or round(value) in allowed:
+            continue
+        # Allow rounding to the nearest hundred or thousand of a real figure.
+        near = any(abs(value - a) <= max(abs(a) * 0.005, 1.0) for a in allowed)
+        if not near:
+            suspicious.append(raw)
+    seen, unique = set(), []
+    for s in suspicious:
+        if s not in seen:
+            seen.add(s)
+            unique.append(s)
+    return unique
+
+
+SCENARIO_SYSTEM = """You turn a business owner's sentence into forecast
+parameter changes for a cash flow model. You must not calculate anything and
+must not state any figures. Reply with JSON only, in this shape:
+
+{"label": "short name for this scenario",
+ "changes": [
+   {"type": "expense_amount", "line": "<exact existing line name>",
+    "new_amount": 8000, "from_month": "2026-10"},
+   {"type": "expense_stop", "line": "<exact existing line name>",
+    "from_month": "2026-11"},
+   {"type": "expense_add", "line": "New line name", "new_amount": 1200,
+    "due_day": 15, "from_month": "2026-09", "flexible": true},
+   {"type": "setting", "name": "payroll", "value": 150000},
+   {"type": "collections_month", "month": "2026-11", "amount": 250000},
+   {"type": "collections_percent", "percent": -20, "from_month": "2026-11"}
+ ],
+ "assumptions": "anything you had to guess, in one or two sentences",
+ "unclear": "what you could not work out, or an empty string"}
+
+Rules. Use only line names that appear in the expense_lines you are given;
+if the owner names something that does not exist, put it in unclear rather
+than guessing. Settings you may change: payroll, css, pluxee, viatico,
+decimo, start_cash, loc_limit, loc_rate. Months are YYYY-MM. If no month is
+given, use the current month from the facts. Never invent a change the owner
+did not ask for."""
+
+
+def parse_scenario(reply):
+    try:
+        got = json.loads(reply)
+    except Exception:
+        return None, "The model did not return usable JSON."
+    if not isinstance(got, dict) or not isinstance(got.get("changes"), list):
+        return None, "The model's reply had no list of changes in it."
+    return got, None
+
+
+def apply_scenario(saved, expenses, revenues, changes):
+    """Apply parameter changes and report exactly what was done and refused.
+
+    Nothing is saved. This builds throwaway copies so a scenario can never
+    overwrite the real plan.
+    """
+    new_saved = dict(saved)
+    frame = (expenses.copy() if expenses is not None and not expenses.empty
+             else pd.DataFrame(columns=EXPENSE_COLUMNS))
+    rev = (revenues.copy() if revenues is not None and not revenues.empty
+           else pd.DataFrame(columns=REVENUE_COLUMNS))
+    did, refused = [], []
+    allowed_settings = {"payroll", "css", "pluxee", "viatico", "decimo",
+                        "start_cash", "loc_limit", "loc_rate"}
+
+    def find_rows(name):
+        if frame.empty:
+            return []
+        want = str(name).strip().lower()
+        return [i for i in frame.index
+                if str(frame.at[i, "Expense"]).strip().lower() == want]
+
+    for ch in changes:
+        if not isinstance(ch, dict):
+            continue
+        kind = str(ch.get("type", ""))
+        try:
+            if kind == "expense_amount":
+                rows = find_rows(ch.get("line"))
+                if not rows:
+                    refused.append("No expense line called '"
+                                   + str(ch.get("line")) + "'.")
+                    continue
+                month = normalise_month(ch.get("from_month")) \
+                    or month_label(date.today())
+                amount = float(ch.get("new_amount"))
+                i = rows[-1]
+                old = frame.loc[i].to_dict()
+                # Close the old row the month before, open a new one at the
+                # new amount, so history keeps the figure it really had.
+                prev = previous_month(month)
+                frame.at[i, "Ends"] = prev
+                fresh = dict(old)
+                fresh["Monthly amount"] = amount
+                fresh["Starts"] = month
+                fresh["Ends"] = normalise_month(old.get("Ends", "")) or ""
+                frame = pd.concat([frame, pd.DataFrame([fresh])],
+                                  ignore_index=True)
+                did.append(str(old["Expense"]) + " becomes "
+                           + MONEY.format(amount) + " from " + month
+                           + ", was " + MONEY.format(float(
+                               old["Monthly amount"])))
+            elif kind == "expense_stop":
+                rows = find_rows(ch.get("line"))
+                if not rows:
+                    refused.append("No expense line called '"
+                                   + str(ch.get("line")) + "'.")
+                    continue
+                month = normalise_month(ch.get("from_month")) \
+                    or month_label(date.today())
+                for i in rows:
+                    frame.at[i, "Ends"] = previous_month(month)
+                did.append(str(ch.get("line")) + " stops from " + month)
+            elif kind == "expense_add":
+                month = normalise_month(ch.get("from_month")) or ""
+                amount = float(ch.get("new_amount"))
+                row = {"Expense": str(ch.get("line", "New expense")),
+                       "Monthly amount": amount,
+                       "Day of month": int(ch.get("due_day", 25) or 25),
+                       "Starts": month, "Ends": "",
+                       "Flexible": bool(ch.get("flexible", False))}
+                frame = pd.concat([frame, pd.DataFrame([row])],
+                                  ignore_index=True)
+                did.append("New line " + row["Expense"] + " at "
+                           + MONEY.format(amount) + " on day "
+                           + str(row["Day of month"])
+                           + (" from " + month if month else ""))
+            elif kind == "setting":
+                name = str(ch.get("name", ""))
+                if name not in allowed_settings:
+                    refused.append("Not allowed to change the setting '"
+                                   + name + "'.")
+                    continue
+                value = float(ch.get("value"))
+                did.append(name + " becomes " + MONEY.format(value)
+                           + ", was " + MONEY.format(
+                               float(new_saved.get(name, 0.0))))
+                new_saved[name] = value
+            elif kind == "collections_month":
+                month = normalise_month(ch.get("month"))
+                if not month:
+                    refused.append("A collections change needs a month.")
+                    continue
+                amount = float(ch.get("amount"))
+                day = int(new_saved.get("revenue_day", 20) or 20)
+                if not rev.empty and month in set(rev["Month"].astype(str)):
+                    rev.loc[rev["Month"].astype(str) == month,
+                            "Expected collections"] = amount
+                else:
+                    rev = pd.concat([rev, pd.DataFrame([{
+                        "Month": month, "Expected collections": amount,
+                        "Day of month": day}])], ignore_index=True)
+                new_saved["revenue_mode"] = "Enter a figure for each month"
+                did.append("Collections in " + month + " become "
+                           + MONEY.format(amount))
+            elif kind == "collections_percent":
+                pct = float(ch.get("percent"))
+                month = normalise_month(ch.get("from_month")) or ""
+                if rev.empty:
+                    refused.append("There is no month-by-month collections "
+                                   "table to adjust.")
+                    continue
+                mask = (rev["Month"].astype(str) >= month) if month \
+                    else pd.Series(True, index=rev.index)
+                rev.loc[mask, "Expected collections"] = (
+                    pd.to_numeric(rev.loc[mask, "Expected collections"],
+                                  errors="coerce").fillna(0.0)
+                    * (1.0 + pct / 100.0))
+                new_saved["revenue_mode"] = "Enter a figure for each month"
+                did.append("Collections change by " + str(pct) + " percent"
+                           + (" from " + month if month else ""))
+            else:
+                refused.append("Unknown change type '" + kind + "'.")
+        except Exception as exc:
+            refused.append("Could not apply " + kind + ": " + str(exc)[:120])
+
+    if not frame.empty:
+        for c in EXPENSE_COLUMNS:
+            if c not in frame.columns:
+                frame[c] = "" if c in ("Starts", "Ends") else False
+        frame = frame[EXPENSE_COLUMNS]
+    return new_saved, frame, rev, did, refused
+
+
+def previous_month(label):
+    """The month before a YYYY-MM label."""
+    try:
+        y, m = [int(x) for x in str(label).split("-")[:2]]
+    except Exception:
+        return ""
+    return f"{y - 1:04d}-12" if m == 1 else f"{y:04d}-{m - 1:02d}"
+
+
+def scenario_engine(saved, expenses, revenues, extra, sev, days):
+    """Run the real forecast for a set of parameters."""
+    if str(saved.get("revenue_mode", "")).lower().startswith("build"):
+        plan = agent_revenue_schedule(load_agent_schedule(),
+                                      int(saved.get("revenue_day", 20)),
+                                      int(saved.get("revenue_lag", 0)))
+    else:
+        plan = revenues
+    return build_schedule(saved, days, sev, expenses, plan, extra)
+
+
+def compare_plans(base_monthly, what_if_monthly):
+    """Month by month, today's plan against the scenario."""
+    rows = []
+    months = list(dict.fromkeys(list(base_monthly["Month"])
+                                + list(what_if_monthly["Month"])))
+    for m in months:
+        a = base_monthly[base_monthly["Month"] == m]
+        b = what_if_monthly[what_if_monthly["Month"] == m]
+        base_end = float(a["Ending Balance"].iloc[0]) if not a.empty else 0.0
+        new_end = float(b["Ending Balance"].iloc[0]) if not b.empty else 0.0
+        base_out = float(a["Other Fixed"].iloc[0]) if not a.empty else 0.0
+        new_out = float(b["Other Fixed"].iloc[0]) if not b.empty else 0.0
+        rows.append({"Month": m,
+                     "Other Fixed now": base_out,
+                     "Other Fixed after": new_out,
+                     "Ending Balance now": base_end,
+                     "Ending Balance after": new_end,
+                     "Improvement": new_end - base_end})
+    return pd.DataFrame(rows)
+
+
+def gap_candidates(saved, df, ledger, bank):
+    """Where the missing money probably is, worked out rather than guessed.
+
+    Compares what the forecast scheduled against what the log records, for the
+    period the bank balances actually cover.
+    """
+    if bank.empty or len(bank) < 1:
+        return pd.DataFrame(), None, None
+    b = bank.sort_values("Date")
+    anchor_date = str(b.iloc[0]["Date"])[:10]
+    latest_date = str(b.iloc[-1]["Date"])[:10]
+    if ledger is None or ledger.empty:
+        return pd.DataFrame(), anchor_date, latest_date
+    log = ledger.copy()
+    log["Date"] = log["Date"].astype(str).str[:10]
+    window = log[(log["Date"] > anchor_date) & (log["Date"] <= latest_date)]
+    logged = {}
+    for _, r in window.iterrows():
+        cat = forecast_bucket(str(r["Category"]))
+        amount = float(r.get("Money in", 0.0) or 0.0) \
+            - float(r.get("Money out", 0.0) or 0.0)
+        logged[cat] = logged.get(cat, 0.0) + amount
+    plan = df.copy()
+    plan["Date"] = plan["Date"].astype(str).str[:10]
+    plan = plan[(plan["Date"] > anchor_date) & (plan["Date"] <= latest_date)]
+    rows = []
+    for cat in LEDGER_CATEGORIES:
+        if cat in ("Other", "Credit Payment") or cat not in plan.columns:
+            continue
+        scheduled = float(plan[cat].sum())
+        if cat not in MONEY_IN_CATEGORIES:
+            scheduled = -scheduled
+        recorded = logged.get(cat, 0.0)
+        if abs(scheduled) < 0.01 and abs(recorded) < 0.01:
+            continue
+        rows.append({"Category": cat,
+                     "Forecast expected": scheduled,
+                     "Log records": recorded,
+                     "Not yet logged": scheduled - recorded})
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out = out.reindex(out["Not yet logged"].abs()
+                          .sort_values(ascending=False).index)
+    return out, anchor_date, latest_date
+
+
+# --------------------------------------------------------------------------
 # Accounts and access levels
 #
 # Three levels. Admin owns the model and the accounts. User records facts:
@@ -3392,5 +3888,386 @@ elif page == "Accounts":
                     st.rerun()
 
 elif page == "AI Assistant":
-    st.write("Internal performance assistant.")
-    st.info("Assistant will be added here.")
+    st.write(
+        "Ask about your numbers, try a change in plain English, or have a "
+        "month written up. Every figure comes from the same forecast engine "
+        "behind the Dashboard. The assistant explains and drafts, it never "
+        "does the arithmetic."
+    )
+    if not can_enter:
+        st.warning(
+            "The assistant is available to admin and user accounts. Your "
+            "account is view-only."
+        )
+        st.stop()
+
+    ai_saved = load_settings()
+    ai_sev = scheduled_payments(load_terminations())
+    try:
+        ai_target = date.fromisoformat(str(ai_saved.get("end_date"))[:10])
+        ai_days = max((ai_target - date.today()).days + 1, 30)
+    except Exception:
+        ai_days = int(ai_saved.get("horizon", 120))
+    ai_expenses = load_expense_schedule()
+    ai_revenues = load_revenue_schedule()
+    ai_extra = load_extra_revenue()
+    if ai_saved.get("revenue_mode") == "Build from agent hours":
+        ai_plan_rev = agent_revenue_schedule(
+            load_agent_schedule(), int(ai_saved.get("revenue_day", 20)),
+            int(ai_saved.get("revenue_lag", 0)))
+    else:
+        ai_plan_rev = ai_revenues
+    ai_df = build_schedule(ai_saved, ai_days, ai_sev, ai_expenses,
+                           ai_plan_rev, ai_extra)
+    ai_monthly = monthly_summary(ai_df)
+    ai_ledger = load_ledger()
+    ai_bank = load_bank()
+    facts = assistant_facts(ai_saved, ai_df, ai_monthly, ai_expenses,
+                            ai_ledger, ai_bank)
+    ok_numbers = allowed_numbers(facts)
+
+    have_key = bool(assistant_key())
+    if not have_key:
+        st.info(
+            "No API key is set, so the written answers are switched off. The "
+            "figures, comparisons and gap analysis below still work, because "
+            "this app calculates them itself. To switch on the written part, "
+            "add OPENAI_API_KEY under App settings then Secrets."
+        )
+
+    lang = st.radio("Language", ["English", "Espanol"], horizontal=True,
+                    key="ai_lang")
+    spanish = lang == "Espanol"
+    lang_rule = ("Write your answer in Spanish, in the Spanish used in "
+                 "Panama business." if spanish else "Write in English.")
+
+    BASE_RULES = """You are the finance assistant inside a company's own cash
+flow app. You are given a JSON block of figures that the app calculated. Those
+figures are the only numbers that exist. Never calculate, estimate, adjust or
+invent a figure. If a number you want is not in the JSON, say plainly that the
+app does not have it. Adding two figures the JSON contains is fine; guessing
+one is not. Write for a business owner, not an accountant: short sentences, no
+jargon, no bullet lists longer than five items. Never advise on tax or law.
+Decimo is Panama's thirteenth month, paid in three parts on 15 April, 15 August
+and 15 December. """
+
+    def show_audit(text):
+        odd = audit_numbers(text, ok_numbers)
+        if odd:
+            st.warning(
+                "Check these figures before relying on them. They are not in "
+                "the data the assistant was given, so they may be sums it "
+                "worked out or numbers it invented: " + ", ".join(odd[:8])
+            )
+
+    tab_ask, tab_what, tab_write, tab_gap = st.tabs(
+        ["Ask a question", "Try a change", "Monthly write-up",
+         "Log versus bank"])
+
+    # ------------------------------------------------------------------
+    with tab_ask:
+        st.subheader("Ask about your numbers")
+        st.caption(
+            "The assistant sees your forecast, your monthly totals, your "
+            "expense lines and this month's actuals. It does not see "
+            "employee names or individual pay."
+        )
+        for entry in st.session_state.get("ai_history", []):
+            with st.chat_message(entry["role"]):
+                st.markdown(entry["text"])
+
+        question = st.chat_input("For example: why is December so tight?")
+        if question:
+            st.session_state.setdefault("ai_history", []).append(
+                {"role": "user", "text": question})
+            with st.chat_message("user"):
+                st.markdown(question)
+            history = st.session_state["ai_history"][-7:-1]
+            prior = "\n".join(h["role"] + ": " + h["text"] for h in history)
+            with st.chat_message("assistant"):
+                if not have_key:
+                    fallback = (
+                        "I cannot write an answer without an API key, but "
+                        "here is what the numbers say.")
+                    st.markdown(fallback)
+                    st.dataframe(money_table(ai_monthly),
+                                 hide_index=True, use_container_width=True)
+                    st.session_state["ai_history"].append(
+                        {"role": "assistant", "text": fallback})
+                else:
+                    with st.spinner("Reading your figures"):
+                        reply, err = ask_model(
+                            BASE_RULES + lang_rule
+                            + " Answer the question directly in the first "
+                              "sentence, then give the reason.",
+                            "Figures:\n" + json.dumps(facts, default=str)
+                            + ("\n\nEarlier in this conversation:\n" + prior
+                               if prior else "")
+                            + "\n\nQuestion: " + question)
+                    if err:
+                        st.error(err)
+                        st.session_state["ai_history"].pop()
+                    else:
+                        st.markdown(reply)
+                        show_audit(reply)
+                        st.session_state["ai_history"].append(
+                            {"role": "assistant", "text": reply})
+        if st.session_state.get("ai_history"):
+            if st.button("Clear this conversation", key="ai_clear"):
+                st.session_state["ai_history"] = []
+                st.rerun()
+
+    # ------------------------------------------------------------------
+    with tab_what:
+        st.subheader("Describe a change and see what it does")
+        st.caption(
+            "Nothing here is saved. It runs your real forecast twice, once as "
+            "it stands and once with the change, and shows the difference."
+        )
+        st.write("Your expense lines, for reference:")
+        if ai_expenses is not None and not ai_expenses.empty:
+            st.dataframe(ai_expenses, hide_index=True,
+                         use_container_width=True)
+        idea = st.text_area(
+            "What do you want to try?",
+            placeholder=("Cut the Management Fee to 8,000 and Tech to 1,000 "
+                         "from October, and stop the supplies line in "
+                         "November."),
+            key="ai_idea", height=90)
+        if st.button("Work it out", key="ai_run", type="primary"):
+            if not idea.strip():
+                st.warning("Describe the change first.")
+            elif not have_key:
+                st.error(
+                    "Turning a sentence into forecast changes needs the API "
+                    "key. Without it, use the Cash Flow page and change the "
+                    "figures by hand."
+                )
+            else:
+                with st.spinner("Reading your sentence"):
+                    raw, err = ask_model(
+                        SCENARIO_SYSTEM,
+                        "Existing expense lines and current settings:\n"
+                        + json.dumps({
+                            "expense_lines": facts["expense_lines"],
+                            "monthly_obligations":
+                                facts["monthly_obligations"],
+                            "current_month": month_label(date.today())},
+                            default=str)
+                        + "\n\nThe owner says: " + idea,
+                        want_json=True)
+                if err:
+                    st.error(err)
+                else:
+                    plan, perr = parse_scenario(raw)
+                    if perr:
+                        st.error(perr)
+                    else:
+                        st.session_state["ai_scenario"] = plan
+                        st.session_state["ai_scenario_text"] = idea
+
+        plan = st.session_state.get("ai_scenario")
+        if plan:
+            st.markdown("### " + str(plan.get("label", "Scenario")))
+            new_saved, new_exp, new_rev, did, refused = apply_scenario(
+                ai_saved, ai_expenses, ai_revenues, plan.get("changes", []))
+            if did:
+                st.write("What this changes:")
+                for line in did:
+                    st.write("- " + line)
+            if refused:
+                st.warning("Not applied:")
+                for line in refused:
+                    st.write("- " + line)
+            if plan.get("assumptions"):
+                st.caption("Assumed: " + str(plan["assumptions"]))
+            if plan.get("unclear"):
+                st.info("Unclear: " + str(plan["unclear"]))
+
+            if did:
+                what_if = scenario_engine(new_saved, new_exp, new_rev,
+                                          ai_extra, ai_sev, ai_days)
+                wi_monthly = monthly_summary(what_if)
+                base_low = float(ai_df["Balance"].min())
+                new_low = float(what_if["Balance"].min())
+                base_end = float(ai_df["Balance"].iloc[-1])
+                new_end = float(what_if["Balance"].iloc[-1])
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Lowest point", MONEY.format(new_low),
+                          MONEY.format(new_low - base_low))
+                c2.metric("Balance at the end", MONEY.format(new_end),
+                          MONEY.format(new_end - base_end))
+                base_neg = int((ai_df["Balance"] < 0).sum())
+                new_neg = int((what_if["Balance"] < 0).sum())
+                c3.metric("Days below zero", str(new_neg),
+                          str(new_neg - base_neg), delta_color="inverse")
+                if base_neg and not new_neg:
+                    st.success("This change clears every negative day.")
+                elif new_neg:
+                    worst = what_if.loc[what_if["Balance"].idxmin()]
+                    st.warning(
+                        "Still short. The worst day is "
+                        + str(worst["Date"])[:10] + " at "
+                        + MONEY.format(float(worst["Balance"])) + "."
+                    )
+                st.write("Month by month:")
+                st.dataframe(
+                    money_table(compare_plans(ai_monthly, wi_monthly)),
+                    hide_index=True, use_container_width=True)
+
+                if have_key:
+                    if st.button("Explain this in words", key="ai_explain"):
+                        wi_facts = assistant_facts(
+                            new_saved, what_if, wi_monthly, new_exp,
+                            ai_ledger, ai_bank)
+                        with st.spinner("Writing"):
+                            words, werr = ask_model(
+                                BASE_RULES + lang_rule
+                                + " You are given the plan as it stands and "
+                                  "the same plan with a change applied. In "
+                                  "under 200 words say what the change does "
+                                  "to the cash position and whether it is "
+                                  "enough. Be straight about it if it is not.",
+                                json.dumps({
+                                    "the_change_requested":
+                                        st.session_state.get(
+                                            "ai_scenario_text", ""),
+                                    "what_was_changed": did,
+                                    "plan_now": facts,
+                                    "plan_after": wi_facts}, default=str))
+                        if werr:
+                            st.error(werr)
+                        else:
+                            st.markdown(words)
+                            show_audit(json.dumps(wi_facts) and words)
+            if st.button("Clear this scenario", key="ai_clear_scen"):
+                st.session_state.pop("ai_scenario", None)
+                st.rerun()
+
+    # ------------------------------------------------------------------
+    with tab_write:
+        st.subheader("Monthly commentary")
+        st.caption(
+            "A written summary of one month, from your forecast and whatever "
+            "you have logged. Copy it into a board pack or an email."
+        )
+        month_choices = list(ai_monthly["Month"])
+        if not month_choices:
+            st.info("There is no forecast to write about yet.")
+        else:
+            here = month_label(date.today())
+            pick = st.selectbox(
+                "Month", month_choices,
+                index=(month_choices.index(here)
+                       if here in month_choices else 0),
+                key="ai_month")
+            tone = st.radio(
+                "Written for",
+                ["Me, plain and blunt", "The board", "The bank"],
+                key="ai_tone")
+            row = ai_monthly[ai_monthly["Month"] == pick]
+            st.dataframe(money_table(row), hide_index=True,
+                         use_container_width=True)
+            if st.button("Write it", key="ai_write", type="primary"):
+                if not have_key:
+                    st.error("Written commentary needs the API key.")
+                else:
+                    audience = {
+                        "Me, plain and blunt": (
+                            "The reader is the owner. Be blunt. Lead with "
+                            "anything that could go wrong."),
+                        "The board": (
+                            "The reader is a board of directors. Be measured "
+                            "and factual, no drama, no hedging."),
+                        "The bank": (
+                            "The reader is a lender. Be precise and "
+                            "conservative. Do not make promises or forecasts "
+                            "beyond the figures given."),
+                    }[tone]
+                    with st.spinner("Writing"):
+                        text, terr = ask_model(
+                            BASE_RULES + lang_rule + " " + audience
+                            + " Write commentary on the month "
+                            + pick + " only. Three or four short paragraphs. "
+                              "Cover the cash position, what drove it, and "
+                              "what to watch next. If actuals exist for this "
+                              "month, say how they compare to plan and note "
+                              "that the month may be part way through. No "
+                              "heading, no sign-off.",
+                            json.dumps(facts, default=str)
+                            + "\n\nWrite about the month: " + pick)
+                    if terr:
+                        st.error(terr)
+                    else:
+                        st.markdown(text)
+                        show_audit(text)
+                        st.text_area("Copy this", text, height=260,
+                                     key="ai_write_copy")
+
+    # ------------------------------------------------------------------
+    with tab_gap:
+        st.subheader("Why the log and the bank disagree")
+        st.caption(
+            "The forecast says one thing, your daily log says another, and "
+            "the bank says a third. This works out where the difference sits."
+        )
+        gaps, from_day, to_day = gap_candidates(ai_saved, ai_df, ai_ledger,
+                                                ai_bank)
+        if ai_bank is None or ai_bank.empty:
+            st.info(
+                "Enter at least one bank balance on the Daily Log page and "
+                "this will start working."
+            )
+        elif len(ai_bank) < 2:
+            st.info(
+                "There is only one bank balance on record, from "
+                + str(ai_bank.iloc[0]["Date"])[:10] + ". Enter a second one "
+                "on a later date and this page can compare the movement "
+                "between them against your log."
+            )
+        elif gaps.empty:
+            st.success(
+                "Between " + str(from_day) + " and " + str(to_day)
+                + " the log matches what the forecast expected.")
+        else:
+            b = ai_bank.sort_values("Date")
+            moved = float(b.iloc[-1]["Bank balance"]) \
+                - float(b.iloc[0]["Bank balance"])
+            logged_net = float(gaps["Log records"].sum())
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Bank moved", MONEY.format(moved))
+            c2.metric("Log accounts for", MONEY.format(logged_net))
+            c3.metric("Unexplained", MONEY.format(moved - logged_net))
+            st.write(
+                "From " + str(from_day) + " to " + str(to_day)
+                + ", biggest differences first:")
+            st.dataframe(money_table(gaps), hide_index=True,
+                         use_container_width=True)
+            st.caption(
+                "A positive figure under Not yet logged means the forecast "
+                "expected money to move and your log has no entry for it."
+            )
+            if have_key and st.button("Explain the gap", key="ai_gap"):
+                with st.spinner("Working through it"):
+                    words, gerr = ask_model(
+                        BASE_RULES + lang_rule
+                        + " You are given the difference between what the "
+                          "forecast scheduled and what the daily log "
+                          "records, plus how much the bank balance actually "
+                          "moved. Explain in under 200 words where the "
+                          "difference most likely sits and what the owner "
+                          "should check first. The most common reason is a "
+                          "real payment nobody has logged yet, so say so "
+                          "plainly. Do not accuse anyone of anything.",
+                        json.dumps({
+                            "period_from": from_day, "period_to": to_day,
+                            "bank_balance_moved_by": round(moved, 2),
+                            "log_accounts_for": round(logged_net, 2),
+                            "unexplained": round(moved - logged_net, 2),
+                            "by_category": gaps.to_dict("records"),
+                            "context": facts["monthly_obligations"]},
+                            default=str))
+                if gerr:
+                    st.error(gerr)
+                else:
+                    st.markdown(words)

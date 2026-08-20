@@ -223,6 +223,29 @@ def check_locks():
               + ("" if good else "  EXPECTED " + str(sorted(expect))))
         failures += 0 if good else 1
 
+    # The assistant is for admin and user. A viewer gets a plain refusal
+    # and no tabs at all.
+    for role, allowed in (("viewer", False), ("user", True),
+                          ("admin", True)):
+        a = app_for(role).run()
+        a.sidebar.radio[0].set_value("AI Assistant").run()
+        if a.exception:
+            print("FAIL " + role + " on AI Assistant raised: "
+                  + str(a.exception[0].value)[:160])
+            failures += 1
+            continue
+        refused = any("view-only" in str(w.value) for w in a.warning)
+        tabs = len(a.tabs)
+        good = (not refused and tabs > 0) if allowed else (refused
+                                                          and tabs == 0)
+        print(("ok   " if good else "FAIL ")
+              + role + " on AI Assistant: "
+              + ("refused" if refused else "allowed")
+              + ", " + str(tabs) + " tabs"
+              + ("" if good else "  EXPECTED "
+                 + ("allowed with tabs" if allowed else "refused, no tabs")))
+        failures += 0 if good else 1
+
     # A viewer must not even be offered the daily entry forms.
     a = app_for("viewer").run()
     a.sidebar.radio[0].set_value("Daily Log").run()
