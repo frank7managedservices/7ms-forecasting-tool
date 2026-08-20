@@ -1697,6 +1697,170 @@ def verify_password(password, stored):
     return hmac.compare_digest(dk.hex(), want)
 
 
+# --------------------------------------------------------------------------
+# Two-step sign-in
+#
+# Time-based one-time codes, the same kind Google Authenticator produces. The
+# maths is RFC 6238 and short enough to keep here in the standard library, so
+# there is no extra package that can break a deploy. The shared secret is kept
+# per account. Recovery codes exist because a lost phone must not lock the
+# owner out of his own accounts, and each one works once.
+# --------------------------------------------------------------------------
+import base64
+import struct
+import time as _time
+
+TOTP_STEP = 30
+TOTP_DIGITS = 6
+TOTP_DRIFT = 1          # accept the code either side, for a slow clock
+RECOVERY_CODES = 8
+
+
+def new_totp_secret():
+    """A 160-bit secret, base32 as the authenticator apps expect."""
+    return base64.b32encode(_secrets.token_bytes(20)).decode("ascii")
+
+
+def totp_at(secret, counter):
+    """One code for one 30-second slot."""
+    try:
+        padded = str(secret).strip().upper()
+        padded += "=" * ((8 - len(padded) % 8) % 8)
+        key = base64.b32decode(padded, casefold=True)
+    except Exception:
+        return None
+    digest = hmac.new(key, struct.pack(">Q", int(counter)),
+                      hashlib.sha1).digest()
+    offset = digest[-1] & 0x0F
+    chunk = struct.unpack(">I", digest[offset:offset + 4])[0] & 0x7FFFFFFF
+    return str(chunk % (10 ** TOTP_DIGITS)).zfill(TOTP_DIGITS)
+
+
+def totp_now(secret, when=None):
+    return totp_at(secret, int((when or _time.time()) // TOTP_STEP))
+
+
+def check_totp(secret, code, last_used=None, when=None):
+    """Verify a code. Returns (ok, counter_used).
+
+    A code already used is refused even though it is still in date, so that
+    watching someone type one is not enough to reuse it.
+    """
+    digits = "".join(ch for ch in str(code or "") if ch.isdigit())
+    if len(digits) != TOTP_DIGITS:
+        return False, None
+    now = int((when or _time.time()) // TOTP_STEP)
+    for drift in range(-TOTP_DRIFT, TOTP_DRIFT + 1):
+        counter = now + drift
+        want = totp_at(secret, counter)
+        if want and hmac.compare_digest(want, digits):
+            if last_used is not None and counter <= int(last_used):
+                return False, None
+            return True, counter
+    return False, None
+
+
+def totp_uri(secret, login):
+    """The otpauth link an authenticator app reads from a QR code."""
+    from urllib.parse import quote
+    who = quote(str(login or "user"))
+    return ("otpauth://totp/7MS%20Forecasting:" + who
+            + "?secret=" + str(secret).strip().upper()
+            + "&issuer=7MS%20Forecasting&algorithm=SHA1&digits="
+            + str(TOTP_DIGITS) + "&period=" + str(TOTP_STEP))
+
+
+def qr_png(text):
+    """A QR image, or None if the library is missing. Never fatal."""
+    try:
+        import qrcode
+    except Exception:
+        return None
+    try:
+        img = qrcode.make(str(text))
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+    except Exception:
+        return None
+
+
+def new_recovery_codes(count=RECOVERY_CODES):
+    """Readable one-time codes. Grouped in fours so they can be written down."""
+    out = []
+    for _ in range(count):
+        raw = _secrets.token_hex(5).upper()
+        out.append(raw[:4] + "-" + raw[4:8] + "-" + raw[8:])
+    return out
+
+
+def normalise_recovery(code):
+    return "".join(ch for ch in str(code or "").upper()
+                   if ch.isalnum())
+
+
+def hash_recovery(code):
+    """Hashed like a password, so a stolen database yields no usable code."""
+    return hash_password(normalise_recovery(code))
+
+
+def spend_recovery_code(row, code, users=None):
+    """Consume a recovery code. Returns True if it was good.
+
+    The used code is deleted immediately, before anything else happens, so a
+    crash cannot leave it live.
+    """
+    given = normalise_recovery(code)
+    if len(given) < 8:
+        return False
+    kept = list(row.get("recovery") or [])
+    for i, stored in enumerate(kept):
+        if verify_password(given, stored):
+            kept.pop(i)
+            row["recovery"] = kept
+            rows = users if users is not None else load_users()
+            for r in rows:
+                if str(r.get("login")) == str(row.get("login")):
+                    r["recovery"] = kept
+            save_users(rows)
+            return True
+    return False
+
+
+def twofa_on(row):
+    return bool(row and row.get("totp_secret") and row.get("totp_active"))
+
+
+def twofa_required():
+    """Admin can insist on it for every account."""
+    return bool(kv_get("require_2fa") is True)
+
+
+def set_twofa_required(flag):
+    kv_put("require_2fa", bool(flag))
+
+
+def record_totp_use(login, counter):
+    rows = load_users()
+    for r in rows:
+        if str(r.get("login")) == str(login):
+            r["totp_last"] = int(counter)
+    save_users(rows)
+
+
+def clear_twofa(login):
+    """Turn it off for someone locked out. Admin only, and it is logged
+    nowhere else, so the account is open again on the next sign-in."""
+    rows = load_users()
+    for r in rows:
+        if str(r.get("login")) == str(login):
+            r.pop("totp_secret", None)
+            r.pop("totp_active", None)
+            r.pop("totp_last", None)
+            r.pop("recovery", None)
+    save_users(rows)
+
+
 def load_users():
     rows = kv_get("users")
     return rows if isinstance(rows, list) else []
@@ -1752,17 +1916,201 @@ def require_login():
         # wrong password take the same time to answer.
         stored = found.get("password", "") if found else hash_password("x")
         if found and verify_password(pw, stored):
-            st.session_state["auth_user"] = {
-                "login": found.get("login", ""),
-                "name": found.get("name", found.get("login", "")),
-                "email": found.get("email", ""),
-                "role": found.get("role", "viewer"),
-                "must_change": bool(found.get("must_change", False)),
-            }
-            st.rerun()
+            if twofa_on(found):
+                # Password was right but the account is protected. Hold the
+                # name only, never the password, and ask for the code.
+                st.session_state["auth_half"] = str(found.get("login", ""))
+                st.rerun()
+            else:
+                sign_in_as(found)
+                st.rerun()
         else:
             st.error("That username or password is not right.")
     st.stop()
+
+
+def sign_in_as(found):
+    st.session_state.pop("auth_half", None)
+    st.session_state["auth_user"] = {
+        "login": found.get("login", ""),
+        "name": found.get("name", found.get("login", "")),
+        "email": found.get("email", ""),
+        "role": found.get("role", "viewer"),
+        "must_change": bool(found.get("must_change", False)),
+    }
+
+
+def require_second_step():
+    """The code screen. Only reachable once a password has been accepted."""
+    half = st.session_state.get("auth_half")
+    if not half:
+        return
+    users = load_users()
+    found = find_user(users, half)
+    if not found or not twofa_on(found):
+        # Two-step was switched off while this screen was open.
+        st.session_state.pop("auth_half", None)
+        if found:
+            sign_in_as(found)
+        st.rerun()
+    st.title("7MS Forecasting Tool")
+    st.subheader("Enter your code")
+    st.write(
+        "Open your authenticator app and type the six digits it shows for "
+        "7MS Forecasting. The code changes every 30 seconds."
+    )
+    with st.form("second_step"):
+        code = st.text_input("Six-digit code", max_chars=7)
+        go = st.form_submit_button("Continue")
+    if go:
+        ok, counter = check_totp(found.get("totp_secret"), code,
+                                 found.get("totp_last"))
+        if ok:
+            record_totp_use(found.get("login"), counter)
+            sign_in_as(found)
+            st.rerun()
+        else:
+            st.error(
+                "That code was not accepted. If you have just used it, wait "
+                "for the next one. If your phone clock is wrong the codes "
+                "will never match."
+            )
+
+    with st.expander("I do not have my phone"):
+        st.write(
+            "Use one of the recovery codes you saved when you set this up. "
+            "Each one works once and is then gone."
+        )
+        with st.form("recovery_step"):
+            rec = st.text_input("Recovery code")
+            rgo = st.form_submit_button("Use this code")
+        if rgo:
+            if spend_recovery_code(found, rec, users):
+                left = len(found.get("recovery") or [])
+                sign_in_as(found)
+                st.session_state["recovery_notice"] = left
+                st.rerun()
+            else:
+                st.error("That recovery code is not valid or has been used.")
+        st.caption(
+            "Out of codes and locked out? The administrator can switch "
+            "two-step off for your account from the Accounts page."
+        )
+    if st.button("Start again"):
+        st.session_state.pop("auth_half", None)
+        st.rerun()
+    st.stop()
+
+
+def force_twofa_setup():
+    """When the administrator insists on two-step, nobody gets past this."""
+    u = current_user()
+    if not u or not twofa_required():
+        return
+    rows = load_users()
+    me = find_user(rows, u.get("login"))
+    if twofa_on(me):
+        return
+    st.title("Two-step sign-in is required")
+    st.write(
+        "The administrator has made two-step sign-in compulsory on this app. "
+        "Set it up now and you will not be asked again on this account."
+    )
+    twofa_setup_block(me, rows)
+    st.stop()
+
+
+def twofa_setup_block(me, rows):
+    """Enrolment. The secret is not saved until a real code proves it works,
+    so nobody can lock themselves out by scanning a bad QR code."""
+    pending = st.session_state.get("twofa_pending")
+    if not pending:
+        st.write(
+            "You will need an authenticator app on your phone. Google "
+            "Authenticator, Microsoft Authenticator and Authy all work and "
+            "all are free."
+        )
+        if st.button("Start setting it up", type="primary",
+                    key="twofa_start"):
+            st.session_state["twofa_pending"] = new_totp_secret()
+            st.rerun()
+        return
+
+    st.markdown("### Step 1 - add it to your phone")
+    uri = totp_uri(pending, me.get("login", "user"))
+    png = qr_png(uri)
+    left, right = st.columns([1, 1])
+    with left:
+        if png:
+            st.image(png, caption="Scan this with your authenticator app",
+                     width=220)
+        else:
+            st.info("Type the key in by hand using the box on the right.")
+    with right:
+        st.write("Or type it in by hand:")
+        st.code(pending, language=None)
+        st.caption(
+            "Account name 7MS Forecasting. Time-based, six digits. Those are "
+            "the normal settings, so you should not have to change anything."
+        )
+
+    st.markdown("### Step 2 - prove it works")
+    st.write(
+        "Type the six digits your app is showing right now. Nothing is saved "
+        "until this matches, so you cannot lock yourself out here."
+    )
+    with st.form("twofa_confirm"):
+        code = st.text_input("Six-digit code", max_chars=7)
+        go = st.form_submit_button("Turn on two-step sign-in")
+    if go:
+        ok, counter = check_totp(pending, code)
+        if not ok:
+            st.error(
+                "That code was not accepted. Check you scanned the right "
+                "code, and that your phone clock is set automatically."
+            )
+        else:
+            codes = new_recovery_codes()
+            for r in rows:
+                if str(r.get("login")) == str(me.get("login")):
+                    r["totp_secret"] = pending
+                    r["totp_active"] = True
+                    r["totp_last"] = int(counter)
+                    r["recovery"] = [hash_recovery(c) for c in codes]
+            save_users(rows)
+            st.session_state.pop("twofa_pending", None)
+            st.session_state["twofa_fresh_codes"] = codes
+            st.rerun()
+    if st.button("Cancel", key="twofa_cancel"):
+        st.session_state.pop("twofa_pending", None)
+        st.rerun()
+
+
+def show_fresh_recovery_codes():
+    """Shown once, immediately after enrolment. Never retrievable later."""
+    codes = st.session_state.get("twofa_fresh_codes")
+    if not codes:
+        return False
+    st.success("Two-step sign-in is on.")
+    st.markdown("### Save these recovery codes now")
+    st.warning(
+        "These are the only way back in if you lose your phone. Each one "
+        "works once. This is the only time they will be shown, because they "
+        "are stored hashed and cannot be read back. Print them or put them "
+        "somewhere safe that is not your phone."
+    )
+    st.code("\n".join(codes), language=None)
+    st.download_button(
+        "Download the codes as a text file",
+        "7MS Forecasting Tool - recovery codes\n"
+        "Each code works once. Keep these somewhere safe.\n\n"
+        + "\n".join(codes) + "\n",
+        file_name="7ms-recovery-codes.txt", mime="text/plain",
+        key="twofa_dl")
+    if st.button("I have saved them", type="primary", key="twofa_saved"):
+        st.session_state.pop("twofa_fresh_codes", None)
+        st.rerun()
+    return True
 
 
 def force_password_change():
@@ -1805,8 +2153,10 @@ def read_only_note(what="this page"):
     )
 
 
+require_second_step()
 require_login()
 force_password_change()
+force_twofa_setup()
 
 USER = current_user()
 ROLE = role_of()
@@ -1818,7 +2168,7 @@ can_configure = ROLE == "admin"
 
 st.sidebar.title("7MS Forecasting Tool")
 PAGES = ["Dashboard", "Forecast", "Payroll", "Terminations", "Sage Actuals",
-         "Cash Flow", "Daily Log", "AI Assistant"]
+         "Cash Flow", "Daily Log", "AI Assistant", "My Account"]
 if can_configure:
     PAGES.append("Accounts")
 page = st.sidebar.radio("Go to", PAGES)
@@ -1828,26 +2178,9 @@ storage_note()
 st.sidebar.divider()
 st.sidebar.caption("Signed in as " + str(USER.get("name") or USER.get("login")))
 st.sidebar.caption("Access level: " + ROLE + ". " + ROLE_HELP.get(ROLE, ""))
-with st.sidebar.expander("Change my password"):
-    with st.form("own_password"):
-        cur_pw = st.text_input("Current password", type="password")
-        new_a = st.text_input("New password", type="password")
-        new_b = st.text_input("New password again", type="password")
-        changed = st.form_submit_button("Update")
-    if changed:
-        rows = load_users()
-        me = find_user(rows, USER.get("login"))
-        if not me or not verify_password(cur_pw, me.get("password", "")):
-            st.error("Current password is not right.")
-        elif len(new_a) < 10:
-            st.error("Use at least 10 characters.")
-        elif new_a != new_b:
-            st.error("Those two do not match.")
-        else:
-            me["password"] = hash_password(new_a)
-            me["must_change"] = False
-            save_users(rows)
-            st.success("Password updated.")
+# Password changes and two-step now live together on the My Account page,
+# rather than being half here and half there.
+st.sidebar.caption("Password and two-step sign-in are on the My Account page.")
 if st.sidebar.button("Sign out"):
     st.session_state.pop("auth_user", None)
     st.rerun()
@@ -3744,6 +4077,101 @@ elif page == "Daily Log":
         with st.expander("Day by day"):
             money_table(running)
 
+elif page == "My Account":
+    st.write(
+        "Your own password and two-step sign-in. Nothing here affects anyone "
+        "else's account."
+    )
+    me_rows = load_users()
+    me = find_user(me_rows, USER.get("login"))
+    if not me:
+        st.error("Your account could not be found in the database.")
+        st.stop()
+
+    st.subheader("Two-step sign-in")
+    if show_fresh_recovery_codes():
+        st.stop()
+    if twofa_on(me):
+        left = len(me.get("recovery") or [])
+        st.success("Two-step sign-in is on for " + str(me.get("login")) + ".")
+        if left == 0:
+            st.error(
+                "You have no recovery codes left. If you lose your phone now "
+                "you will need the administrator to switch two-step off. "
+                "Generate a new set below."
+            )
+        elif left <= 2:
+            st.warning("Only " + str(left) + " recovery codes left.")
+        else:
+            st.caption(str(left) + " recovery codes left.")
+
+        with st.expander("Generate a new set of recovery codes"):
+            st.write(
+                "This throws away any codes you have now and gives you "
+                + str(RECOVERY_CODES) + " new ones. Do this if you think "
+                "someone has seen your old list."
+            )
+            if st.button("Replace my recovery codes", key="twofa_newrec"):
+                codes = new_recovery_codes()
+                for r in me_rows:
+                    if str(r.get("login")) == str(me.get("login")):
+                        r["recovery"] = [hash_recovery(c) for c in codes]
+                save_users(me_rows)
+                st.session_state["twofa_fresh_codes"] = codes
+                st.rerun()
+
+        with st.expander("Turn two-step sign-in off"):
+            if twofa_required():
+                st.info(
+                    "The administrator has made two-step compulsory, so it "
+                    "cannot be switched off on this account."
+                )
+            else:
+                st.write(
+                    "Your password alone will get someone in after this. "
+                    "Confirm your password to switch it off."
+                )
+                with st.form("twofa_off"):
+                    pw_off = st.text_input("Your password", type="password")
+                    off = st.form_submit_button("Switch two-step off")
+                if off:
+                    if not verify_password(pw_off, me.get("password", "")):
+                        st.error("That password is not right.")
+                    else:
+                        clear_twofa(me.get("login"))
+                        st.success("Two-step sign-in is off.")
+                        st.rerun()
+    else:
+        st.info(
+            "Two-step sign-in is off. Your password on its own opens this "
+            "app, and it holds your payroll and banking figures."
+        )
+        twofa_setup_block(me, me_rows)
+
+    st.divider()
+    st.subheader("Change your password")
+    with st.form("own_password"):
+        old_pw = st.text_input("Your current password", type="password")
+        new_a = st.text_input("New password", type="password")
+        new_b = st.text_input("New password again", type="password")
+        chg = st.form_submit_button("Change my password")
+    if chg:
+        if not verify_password(old_pw, me.get("password", "")):
+            st.error("Your current password is not right.")
+        elif len(new_a) < 10:
+            st.error("Use at least 10 characters.")
+        elif new_a != new_b:
+            st.error("Those two do not match.")
+        elif new_a == old_pw:
+            st.error("That is the password you already have.")
+        else:
+            for r in me_rows:
+                if str(r.get("login")) == str(me.get("login")):
+                    r["password"] = hash_password(new_a)
+                    r["must_change"] = False
+            save_users(me_rows)
+            st.success("Your password is changed.")
+
 elif page == "Accounts":
     if not can_configure:
         st.error("Only an administrator can open this page.")
@@ -3772,9 +4200,60 @@ elif page == "Accounts":
                 "Email": u.get("email", ""),
                 "Level": u.get("role", "viewer"),
                 "Must change password": bool(u.get("must_change", False)),
+                "Two-step": "on" if twofa_on(u) else "off",
+                "Recovery codes left": len(u.get("recovery") or []),
             } for u in users]),
             use_container_width=True, hide_index=True,
         )
+
+    st.subheader("Two-step sign-in")
+    st.write(
+        "Two-step means a password plus a six-digit code from a phone app. "
+        "Each person switches it on for themselves from the My Account page. "
+        "You can make it compulsory, and you can rescue anyone who loses "
+        "their phone."
+    )
+    want_all = st.checkbox(
+        "Require two-step sign-in on every account", value=twofa_required(),
+        help="Anyone without it will be made to set it up before they can "
+             "use the app. Nobody gets locked out by this.",
+        key="acct_req2fa")
+    if want_all != twofa_required():
+        set_twofa_required(want_all)
+        st.success("Saved. It applies from each person's next sign-in.")
+        st.rerun()
+
+    protected = [u for u in users if twofa_on(u)]
+    if not protected:
+        st.caption("Nobody has two-step switched on yet.")
+    else:
+        st.write("Locked out? Switching two-step off lets them back in with "
+                 "their password alone, and they can set it up again after.")
+        who_off = st.selectbox(
+            "Account", [u.get("login", "") for u in protected],
+            key="acct_2fa_off")
+        st.warning(
+            "Only do this when you have spoken to the person and you are "
+            "certain who you are talking to. Someone asking you to switch "
+            "this off is exactly how an account gets stolen."
+        )
+        confirm_off = st.checkbox(
+            "I have confirmed who this is",
+            key="acct_2fa_confirm")
+        if st.button("Switch two-step off for this account",
+                     disabled=not confirm_off, key="acct_2fa_go"):
+            if twofa_required():
+                st.error(
+                    "Two-step is compulsory right now, so they would be "
+                    "asked to set it up again immediately. Untick the "
+                    "requirement above first if that is not what you want."
+                )
+            clear_twofa(who_off)
+            st.success(
+                "Two-step is off for " + str(who_off) + ". Tell them to set "
+                "it up again from My Account once they have their phone."
+            )
+            st.rerun()
 
     st.subheader("Add an account")
     if len(users) >= MAX_USERS:

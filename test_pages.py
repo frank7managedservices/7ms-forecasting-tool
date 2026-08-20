@@ -17,7 +17,8 @@ from pathlib import Path
 
 DB = "/tmp/test_pages.db"
 PAGES = ["Dashboard", "Forecast", "Payroll", "Terminations", "Sage Actuals",
-         "Cash Flow", "Daily Log", "AI Assistant", "Accounts"]
+         "Cash Flow", "Daily Log", "AI Assistant", "My Account",
+         "Accounts"]
 
 os.environ["DATABASE_URL"] = f"sqlite:///{DB}"
 Path(DB).unlink(missing_ok=True)
