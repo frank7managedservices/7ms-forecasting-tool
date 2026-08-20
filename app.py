@@ -1892,6 +1892,125 @@ def role_of():
     return str(u.get("role", "viewer")) if u else "viewer"
 
 
+def recovery_codes_left(row):
+    return len(row.get("recovery") or [])
+
+
+def check_two_recovery_codes(row, code_a, code_b):
+    """True if these are two different, currently valid recovery codes.
+
+    Nothing is consumed here. Checking and spending are kept apart so a
+    half-right attempt cannot waste a good code.
+    """
+    a = normalise_recovery(code_a)
+    b = normalise_recovery(code_b)
+    if len(a) < 8 or len(b) < 8:
+        return False
+    if a == b:
+        return False
+    stored = list(row.get("recovery") or [])
+    hit_a = -1
+    for i, h in enumerate(stored):
+        if verify_password(a, h):
+            hit_a = i
+            break
+    if hit_a < 0:
+        return False
+    for i, h in enumerate(stored):
+        if i != hit_a and verify_password(b, h):
+            return True
+    return False
+
+
+def reset_password_with_recovery(login, code_a, code_b, new_password):
+    """Spend two recovery codes to set a new password.
+
+    Returns (ok, message). The message is deliberately vague on failure.
+    """
+    vague = "Those details are not right."
+    if len((new_password or "")) < 10:
+        return False, "Use at least 10 characters for the new password."
+    rows = load_users()
+    row = find_user(rows, login)
+    if not row:
+        return False, vague
+    if not twofa_on(row):
+        return False, (
+            "This account has no recovery codes, because two-step sign-in "
+            "was never switched on for it. Ask an administrator to reset "
+            "the password instead."
+        )
+    if not check_two_recovery_codes(row, code_a, code_b):
+        return False, vague
+    # Both proved good, so now spend them.
+    ok_a = spend_recovery_code(row, code_a, rows)
+    ok_b = spend_recovery_code(row, code_b, rows)
+    if not (ok_a and ok_b):
+        return False, vague
+    rows = load_users()
+    row = find_user(rows, login)
+    if not row:
+        return False, vague
+    row["password"] = hash_password(new_password)
+    # They chose this password themselves, so do not force another change.
+    row["must_change"] = False
+    # Any half-finished sign-in is now stale.
+    save_users(rows)
+    left = recovery_codes_left(row)
+    return True, (
+        "Password changed. You have " + str(left)
+        + " recovery code" + ("" if left == 1 else "s") + " left."
+    )
+
+
+def password_reset_block():
+    """The 'Forgot my password' box, shown under the sign-in form."""
+    with st.expander("Forgot my password"):
+        st.write(
+            "You can set a new password yourself using two of the recovery "
+            "codes you saved when you switched two-step sign-in on. Each "
+            "code works once, so both will be used up."
+        )
+        with st.form("forgot_password"):
+            who = st.text_input("Username or email", key="fp_who")
+            code_a = st.text_input("First recovery code", key="fp_a")
+            code_b = st.text_input("A second, different recovery code",
+                                   key="fp_b")
+            pw_a = st.text_input("New password", type="password", key="fp_pw1")
+            pw_b = st.text_input("New password again", type="password",
+                                 key="fp_pw2")
+            do_reset = st.form_submit_button("Set my new password")
+        if do_reset:
+            if pw_a != pw_b:
+                st.error("Those two passwords do not match.")
+            else:
+                ok, message = reset_password_with_recovery(
+                    who, code_a, code_b, pw_a)
+                if ok:
+                    st.session_state.pop("auth_half", None)
+                    st.success(message)
+                    st.info(
+                        "Now sign in above with your new password. You will "
+                        "still be asked for a code from your authenticator "
+                        "app, or another recovery code."
+                    )
+                    if recovery_left_low(who):
+                        st.warning(
+                            "You are running low on recovery codes. Once you "
+                            "are back in, open My Account and issue a fresh "
+                            "set."
+                        )
+                else:
+                    st.error(message)
+
+
+def recovery_left_low(login, floor=3):
+    row = find_user(load_users(), login)
+    if not row:
+        return False
+    return recovery_codes_left(row) <= floor
+
+
 def require_login():
     """Show the sign-in screen and stop unless someone is signed in."""
     if current_user():
@@ -1926,6 +2045,7 @@ def require_login():
                 st.rerun()
         else:
             st.error("That username or password is not right.")
+    password_reset_block()
     st.stop()
 
 
@@ -2009,6 +2129,13 @@ def force_twofa_setup():
         return
     rows = load_users()
     me = find_user(rows, u.get("login"))
+    if me is None:
+        # The account was removed while this person was signed in. Drop the
+        # session rather than offering to enrol an account that is gone.
+        st.session_state.pop("auth_user", None)
+        st.session_state.pop("auth_half", None)
+        st.warning("That account no longer exists. Please sign in again.")
+        st.stop()
     if twofa_on(me):
         return
     st.title("Two-step sign-in is required")

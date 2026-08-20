@@ -79,10 +79,26 @@ def seed_daily_log():
 CURRENT_ROLE = "admin"
 
 
+def clear_require_2fa():
+    """Switch compulsory two-step off in the test database.
+
+    The blind button sweep on the Accounts page ends up saving the 'require
+    two-step for all accounts' control, which then puts every later page
+    behind the enrolment screen. These tests are about pages rendering, not
+    about that policy, so reset it before each one.
+    """
+    con = sqlite3.connect(DB)
+    con.execute("insert or replace into app_settings(name, body, saved_at)"
+                " values(?,?,datetime('now'))", ("require_2fa", json.dumps(False)))
+    con.commit()
+    con.close()
+
+
 def app_for(role=None):
     """A signed-in AppTest. Every page is behind the login now, so tests have
     to arrive with a session already established or they only ever see the
     sign-in form."""
+    clear_require_2fa()
     a = AppTest.from_file(APP, default_timeout=400)
     r = role or CURRENT_ROLE
     a.session_state["auth_user"] = {
@@ -112,6 +128,11 @@ def seed_users():
     con = sqlite3.connect(DB)
     con.execute("insert or replace into app_settings(name, body, saved_at)"
                 " values(?,?,datetime('now'))", ("users", json.dumps(rows)))
+    # Start from a known state. An earlier run of test_2fa.py leaves the
+    # compulsory-two-step switch on in this same file, which would put every
+    # page behind the setup screen and fail these tests for the wrong reason.
+    con.execute("insert or replace into app_settings(name, body, saved_at)"
+                " values(?,?,datetime('now'))", ("require_2fa", json.dumps(False)))
     con.commit()
     con.close()
 
