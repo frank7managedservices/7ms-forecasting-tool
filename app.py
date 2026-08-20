@@ -1068,7 +1068,11 @@ storage_note()
 st.title(page)
 
 if page == "Dashboard":
-    st.write("Overview of forecast vs actual, cash position, and payroll.")
+    st.write(
+        "Where the money stands today, what needs attention, and what is "
+        "landing next. Everything here is read-only. Edit on the page it "
+        "belongs to."
+    )
     saved = load_settings()
     sev = scheduled_payments(load_terminations())
     try:
@@ -1084,26 +1088,196 @@ if page == "Dashboard":
         dash_rev = load_revenue_schedule()
     df = build_schedule(saved, days, sev, load_expense_schedule(), dash_rev,
                         load_extra_revenue())
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Cash on hand", MONEY.format(saved["start_cash"]))
-    c2.metric("Balance in 30 days", MONEY.format(df["Balance"].iloc[min(29, days - 1)]))
-    c3.metric(f"Balance in {days} days", MONEY.format(df["Balance"].iloc[-1]))
-    c4.metric("Payroll this month", MONEY.format(saved["payroll"]))
-    st.caption(
-        "Decimo per payment: " + MONEY.format(saved.get("decimo", 0.0))
-        + "  ·  paid 15 April, 15 August, 15 December"
-    )
-    if saved.get("loc_limit", 0.0) > 0:
-        drawn_end = df["Credit Balance"].iloc[-1]
-        st.caption(
-            "Line of credit: " + MONEY.format(drawn_end) + " owed at day "
-            + str(days) + " of " + MONEY.format(saved["loc_limit"]) + " limit  ·  "
-            + MONEY.format(df["Credit Draw"].sum()) + " drawn in this window"
+
+    ledger = load_ledger()
+    bank = load_bank()
+    bank_balance, bank_date = None, None
+    if not bank.empty:
+        latest = bank.sort_values("Date").iloc[-1]
+        bank_balance = float(latest["Bank balance"])
+        bank_date = str(latest["Date"])[:10]
+    assumed = float(saved.get("start_cash", 0.0))
+
+    # ---- what needs attention -------------------------------------------
+    alerts = []
+    negative = df[df["Balance"] < 0]
+    if not negative.empty:
+        first_neg = negative.iloc[0]
+        alerts.append(
+            "Cash goes negative on " + str(first_neg["Date"])[:10] + " at "
+            + MONEY.format(first_neg["Balance"]) + ". "
+            + str(len(negative)) + " day(s) below zero in this projection."
         )
-    due = df["Severance"].sum()
-    if due:
-        st.warning(f"Severance due in the next {days} days: {MONEY.format(due)}")
+    limit = float(saved.get("loc_limit", 0.0))
+    if limit > 0:
+        peak_drawn = float(df["Credit Balance"].max())
+        if peak_drawn >= limit - 0.01:
+            when = df[df["Credit Balance"] >= limit - 0.01].iloc[0]["Date"]
+            alerts.append(
+                "The line of credit is fully drawn by " + str(when)[:10]
+                + ", all " + MONEY.format(limit) + " of it. There is no "
+                "headroom left after that date."
+            )
+    sev_due = float(df["Severance"].sum())
+    if sev_due:
+        alerts.append("Severance due in this window: " + MONEY.format(sev_due)
+                      + ".")
+    if bank_balance is not None:
+        drift = bank_balance - assumed
+        if abs(drift) > 1000:
+            alerts.append(
+                "The forecast starts from " + MONEY.format(assumed)
+                + " but the bank held " + MONEY.format(bank_balance) + " on "
+                + bank_date + ", a gap of " + MONEY.format(drift)
+                + ". Some of that gap is money the forecast still expects to "
+                "arrive, so check before changing the starting balance on the "
+                "Cash Flow page."
+            )
+    if bank_balance is None:
+        alerts.append(
+            "No bank balance has been entered on the Daily Log page, so there "
+            "is nothing to check the forecast against."
+        )
+
+    if alerts:
+        st.subheader("Needs attention")
+        for line in alerts:
+            st.warning(line)
+    else:
+        st.success("Nothing needs attention in this projection window.")
+
+    st.divider()
+
+    # ---- cash position ---------------------------------------------------
+    st.subheader("Cash position")
+    c1, c2, c3, c4 = st.columns(4)
+    if bank_balance is None:
+        c1.metric("Bank balance", "not entered",
+                  help="Enter one on the Daily Log page.")
+    else:
+        c1.metric("Bank balance", MONEY.format(bank_balance),
+                  help="Most recent balance typed on the Daily Log page, from "
+                       + bank_date)
+    c2.metric("Forecast starts from", MONEY.format(assumed),
+              help="The starting balance set on the Cash Flow page. The whole "
+                   "projection is built on this number.")
+    c3.metric("Balance in 30 days",
+              MONEY.format(df["Balance"].iloc[min(29, days - 1)]))
+    c4.metric(f"Balance in {days} days", MONEY.format(df["Balance"].iloc[-1]))
+    if bank_balance is not None:
+        st.caption(
+            "Bank balance is as of " + bank_date + ". The forecast is built "
+            "from " + MONEY.format(assumed) + ", not from the bank figure, so "
+            "the two are deliberately independent."
+        )
+
+    # ---- the tightest day ------------------------------------------------
+    st.subheader("Lowest point")
+    low_idx = df["Balance"].idxmin()
+    low = df.loc[low_idx]
+    l1, l2, l3 = st.columns(3)
+    l1.metric("Lowest balance", MONEY.format(low["Balance"]))
+    l2.metric("On", str(low["Date"])[:10])
+    shortfall = max(-float(low["Balance"]), 0.0)
+    l3.metric("Credit needed to cover it", MONEY.format(shortfall),
+              help="How much more cash you would need on that day to stay "
+                   "above zero. Zero means you never run out.")
+    if limit > 0:
+        st.caption(
+            "Credit drawn at the lowest point: "
+            + MONEY.format(float(low["Credit Balance"])) + " of "
+            + MONEY.format(limit) + ". Peak draw across the window: "
+            + MONEY.format(float(df["Credit Balance"].max())) + "."
+        )
+
+    st.divider()
+
+    # ---- the next fortnight ----------------------------------------------
+    st.subheader("Next 14 days")
+    window = df[pd.to_datetime(df["Date"]) <=
+                pd.Timestamp(date.today() + timedelta(days=13))]
+    OUT_COLS = ["Payroll", "CSS / Government", "Pluxee", "Viatico", "Decimo",
+                "Severance", "Other Fixed", "Interest"]
+    IN_COLS = ["Collections", "Other Revenue", "Credit Draw"]
+    events = []
+    for _, r in window.iterrows():
+        for c in IN_COLS + OUT_COLS:
+            amount = float(r.get(c, 0.0) or 0.0)
+            if abs(amount) < 0.01:
+                continue
+            events.append({
+                "Date": str(r["Date"])[:10],
+                "What": c,
+                "In": amount if c in IN_COLS else 0.0,
+                "Out": amount if c in OUT_COLS else 0.0,
+                "Balance after": float(r["Balance"]),
+            })
+    if not events:
+        st.info("Nothing scheduled in the next 14 days.")
+    else:
+        ev = pd.DataFrame(events)
+        money_table(ev)
+        t1, t2, t3 = st.columns(3)
+        t1.metric("Coming in", MONEY.format(ev["In"].sum()))
+        t2.metric("Going out", MONEY.format(ev["Out"].sum()))
+        t3.metric("Net", MONEY.format(ev["In"].sum() - ev["Out"].sum()))
+        st.caption(
+            "Straight from the forecast, not from the log, so it is what is "
+            "scheduled rather than what has happened."
+        )
+
+    st.divider()
+
+    # ---- this month, plan against reality --------------------------------
+    st.subheader("This month: forecast against actual")
+    this_month = date.today().strftime("%Y-%m")
+    actual_monthly = ledger_by_month(ledger)
+    plan_monthly = monthly_summary(df)
+    mine = actual_monthly[actual_monthly["Month"] == this_month] \
+        if not actual_monthly.empty else actual_monthly
+    if actual_monthly.empty or mine.empty:
+        st.info(
+            "Nothing logged for " + this_month + " yet. Add entries on the "
+            "Daily Log page and the comparison appears here."
+        )
+    else:
+        table = variance_table(mine, plan_monthly, this_month)
+        if table.empty:
+            st.info("Nothing to compare for " + this_month + " yet.")
+        else:
+            money_table(table)
+        covered = plan_monthly[plan_monthly["Month"] == this_month]
+        counted = int(covered["Days Counted"].iloc[0]) if not covered.empty else 0
+        month_len = calendar.monthrange(date.today().year,
+                                        date.today().month)[1]
+        if 0 < counted < month_len:
+            st.warning(
+                "The forecast only runs forward from today, so its column "
+                "covers " + str(counted) + " of " + str(month_len)
+                + " days this month while the log may cover the whole month. "
+                "Anything paid before today shows an actual with no forecast "
+                "beside it. Full months compare cleanly."
+            )
+
+    st.divider()
+
+    # ---- payroll and the year -------------------------------------------
+    st.subheader("Payroll and provisions")
+    p1, p2, p3 = st.columns(3)
+    p1.metric("Monthly payroll", MONEY.format(saved.get("payroll", 0.0)))
+    p2.metric("Monthly CSS / government", MONEY.format(saved.get("css", 0.0)))
+    p3.metric("Decimo per payment", MONEY.format(saved.get("decimo", 0.0)))
+    st.caption(
+        "Decimo is paid 15 April, 15 August and 15 December. Payroll splits "
+        "half on the 15th and half on the last day of the month. Figures come "
+        "from the Payroll page, whichever basis you last sent."
+    )
+
+    st.subheader("Projected balance")
     st.line_chart(df.set_index("Date")["Balance"])
+    with st.expander("Month by month"):
+        money_table(plan_monthly)
+
 
 elif page == "Forecast":
     st.write("Monthly forecasting by employee group.")
