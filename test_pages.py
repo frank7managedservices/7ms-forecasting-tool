@@ -1,5 +1,9 @@
 """Page sweep that actually loads data, instead of stopping at an empty form.
 
+Set REAL_DATABASE_URL to copy real settings and saved periods into a throwaway
+local sqlite file before testing. Never hard-code a connection string here:
+this repository is public.
+
 The plain sweep walks every page with an empty database, but Payroll and Sage
 Actuals call st.stop() when no file is loaded, so most of their code never
 runs and a NameError can ship unnoticed. This seeds a real payroll period and
@@ -26,9 +30,10 @@ APP = "/home/user/workspace/7ms/app.py"
 def copy_real_data():
     """Pull the real settings and payroll periods out of Neon into sqlite."""
     from sqlalchemy import create_engine, text
-    url = ("postgresql://neondb_owner:npg_BjZLx1irqyd4@"
-           "ep-wandering-smoke-acyeoaof-pooler.sa-east-1.aws.neon.tech/"
-           "neondb?sslmode=require")
+    url = os.environ.get("REAL_DATABASE_URL")
+    if not url:
+        print("note REAL_DATABASE_URL not set, skipping the real-data tests")
+        return [], []
     eng = create_engine(url, connect_args={"connect_timeout": 20})
     with eng.connect() as c:
         settings = list(c.execute(text("select name, body from app_settings")))
