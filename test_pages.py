@@ -17,7 +17,7 @@ from pathlib import Path
 
 DB = "/tmp/test_pages.db"
 PAGES = ["Dashboard", "Forecast", "Payroll", "Terminations", "Sage Actuals",
-         "Cash Flow", "Daily Log", "AI Assistant"]
+         "Cash Flow", "Daily Log", "AI Assistant", "Accounts"]
 
 os.environ["DATABASE_URL"] = f"sqlite:///{DB}"
 Path(DB).unlink(missing_ok=True)
@@ -75,8 +75,175 @@ def seed_daily_log():
     con.close()
 
 
-def run(page, setup=None):
+CURRENT_ROLE = "admin"
+
+
+def app_for(role=None):
+    """A signed-in AppTest. Every page is behind the login now, so tests have
+    to arrive with a session already established or they only ever see the
+    sign-in form."""
+    a = AppTest.from_file(APP, default_timeout=400)
+    r = role or CURRENT_ROLE
+    a.session_state["auth_user"] = {
+        "login": "test_" + r, "name": "Test " + r, "email": "",
+        "role": r, "must_change": False,
+    }
+    return a
+
+
+def seed_users():
+    """One real account per level, so the login screen itself can be tested."""
+    import hashlib
+    rounds = 200000
+
+    def h(pw, salt="ab" * 16):
+        dk = hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt), rounds)
+        return salt + "$" + dk.hex()
+
+    rows = [
+        {"login": "frank", "name": "Frank Royal", "email": "frank@example.com",
+         "role": "admin", "password": h("adminpassword1"), "must_change": False},
+        {"login": "clerk", "name": "Clerk", "email": "", "role": "user",
+         "password": h("userpassword1"), "must_change": False},
+        {"login": "watcher", "name": "Watcher", "email": "", "role": "viewer",
+         "password": h("viewpassword1"), "must_change": True},
+    ]
+    con = sqlite3.connect(DB)
+    con.execute("insert or replace into app_settings(name, body, saved_at)"
+                " values(?,?,datetime('now'))", ("users", json.dumps(rows)))
+    con.commit()
+    con.close()
+
+
+def check_login():
+    """The gate itself: no session, wrong password, right password, and the
+    forced change when a temporary password is in play."""
+    failures = 0
+
     a = AppTest.from_file(APP, default_timeout=400).run()
+    labels = [str(x.value) for x in a.subheader]
+    gated = "Sign in" in labels and not a.sidebar.radio
+    print(("ok   " if gated else "FAIL ") + "login required with no session")
+    failures += 0 if gated else 1
+
+    a = AppTest.from_file(APP, default_timeout=400).run()
+    a.text_input[0].set_value("frank").run()
+    a.text_input[1].set_value("wrong").run()
+    a.button[0].click().run()
+    refused = bool(a.error) and "auth_user" not in a.session_state
+    print(("ok   " if refused else "FAIL ") + "wrong password refused")
+    failures += 0 if refused else 1
+
+    a = AppTest.from_file(APP, default_timeout=400).run()
+    a.text_input[0].set_value("frank").run()
+    a.text_input[1].set_value("adminpassword1").run()
+    a.button[0].click().run()
+    ok = ("auth_user" in a.session_state
+          and a.session_state["auth_user"]["role"] == "admin")
+    print(("ok   " if ok else "FAIL ") + "correct password signs in as admin")
+    failures += 0 if ok else 1
+
+    a = AppTest.from_file(APP, default_timeout=400).run()
+    a.text_input[0].set_value("clerk").run()
+    a.text_input[1].set_value("userpassword1").run()
+    a.button[0].click().run()
+    ok = ("auth_user" in a.session_state
+          and a.session_state["auth_user"]["role"] == "user")
+    print(("ok   " if ok else "FAIL ") + "email or username both accepted")
+    failures += 0 if ok else 1
+
+    a = AppTest.from_file(APP, default_timeout=400).run()
+    a.text_input[0].set_value("watcher").run()
+    a.text_input[1].set_value("viewpassword1").run()
+    a.button[0].click().run()
+    forced = any("temporary password" in str(w.value) for w in a.warning)
+    print(("ok   " if forced else "FAIL ")
+          + "temporary password forces a change before the app opens")
+    failures += 0 if forced else 1
+
+    # A viewer must not be handed the Accounts page.
+    v = app_for("viewer").run()
+    hidden = "Accounts" not in list(v.sidebar.radio[0].options)
+    print(("ok   " if hidden else "FAIL ") + "Accounts page hidden from viewer")
+    failures += 0 if hidden else 1
+    u = app_for("user").run()
+    hidden = "Accounts" not in list(u.sidebar.radio[0].options)
+    print(("ok   " if hidden else "FAIL ") + "Accounts page hidden from user")
+    failures += 0 if hidden else 1
+    ad = app_for("admin").run()
+    shown = "Accounts" in list(ad.sidebar.radio[0].options)
+    print(("ok   " if shown else "FAIL ") + "Accounts page shown to admin")
+    failures += 0 if shown else 1
+    return failures
+
+
+def check_locks():
+    """Every save must be dead for a viewer, and the forecast assumptions must
+    be dead for a plain user too. Measured on the rendered controls, not on
+    what the source looks like."""
+    failures = 0
+
+    def live_saves(a):
+        out = []
+        for b in list(a.button):
+            label = str(b.label)
+            # Compute-only buttons change nothing that persists.
+            if label in ("Sign out", "Update", "Estimate liquidacion",
+                         "Calculate cash flow"):
+                continue
+            if not b.disabled:
+                out.append(label)
+        return out
+
+    checks = [
+        ("viewer", "Daily Log", []), ("viewer", "Cash Flow", []),
+        ("viewer", "Payroll", []), ("viewer", "Terminations", []),
+        ("viewer", "Sage Actuals", []), ("viewer", "Dashboard", []),
+        ("user", "Cash Flow", []),
+        ("user", "Daily Log", ["Add to the log", "Save this balance",
+                               "Save changes to the log",
+                               "Save bank balances"]),
+        ("admin", "Daily Log", ["Add to the log", "Save this balance",
+                                "Save changes to the log",
+                                "Save bank balances"]),
+    ]
+    for role, page, expect in checks:
+        a = app_for(role).run()
+        a.sidebar.radio[0].set_value(page).run()
+        if a.exception:
+            print("FAIL " + f"{role} on {page} raised: "
+                  + str(a.exception[0].value)[:160])
+            failures += 1
+            continue
+        got = sorted(live_saves(a))
+        good = got == sorted(expect)
+        print(("ok   " if good else "FAIL ")
+              + f"{role} on {page}: "
+              + (", ".join(got) if got else "nothing saveable")
+              + ("" if good else "  EXPECTED " + str(sorted(expect))))
+        failures += 0 if good else 1
+
+    # A viewer must not even be offered the daily entry forms.
+    a = app_for("viewer").run()
+    a.sidebar.radio[0].set_value("Daily Log").run()
+    hidden = not any("Log something that happened" in str(h.value)
+                     for h in a.subheader)
+    print(("ok   " if hidden else "FAIL ")
+          + "entry forms hidden from viewer on Daily Log")
+    failures += 0 if hidden else 1
+
+    # An admin must still be able to save the forecast assumptions.
+    a = app_for("admin").run()
+    a.sidebar.radio[0].set_value("Cash Flow").run()
+    can = any(str(b.label) == "Save these numbers" and not b.disabled
+              for b in a.button)
+    print(("ok   " if can else "FAIL ") + "admin can still save Cash Flow")
+    failures += 0 if can else 1
+    return failures
+
+
+def run(page, setup=None):
+    a = app_for().run()
     a.sidebar.radio[0].set_value(page).run()
     if setup:
         setup(a)
@@ -90,8 +257,11 @@ def main():
     AppTest.from_file(APP, default_timeout=400).run()  # create the tables
     payroll_names, sage_names = copy_real_data()
     seed_daily_log()
+    seed_users()
 
     failures = 0
+    failures += check_login()
+    failures += check_locks()
     for page in PAGES:
         if not run(page):
             failures += 1
@@ -101,7 +271,7 @@ def main():
         def pick(a, _n=name):
             a.selectbox[0].set_value(_n).run()
         label = f"Payroll [{name[:34]}]"
-        a = AppTest.from_file(APP, default_timeout=400).run()
+        a = app_for().run()
         a.sidebar.radio[0].set_value("Payroll").run()
         try:
             a.selectbox[0].set_value(name).run()
@@ -118,7 +288,7 @@ def main():
         # Flip every checkbox and the frequency selector, since each redraw
         # is a fresh script run that can hit different code.
         for idx in range(len(a.checkbox)):
-            b = AppTest.from_file(APP, default_timeout=400).run()
+            b = app_for().run()
             b.sidebar.radio[0].set_value("Payroll").run()
             b.selectbox[0].set_value(name).run()
             if idx >= len(b.checkbox):
@@ -132,7 +302,7 @@ def main():
             if bad:
                 failures += 1
         for freq in ["Mensual - once a month", "Quincenal - twice a month"]:
-            b = AppTest.from_file(APP, default_timeout=400).run()
+            b = app_for().run()
             b.sidebar.radio[0].set_value("Payroll").run()
             b.selectbox[0].set_value(name).run()
             sel = next((s for s in b.selectbox
@@ -145,25 +315,39 @@ def main():
                   + ("" if not bad else "\n      " + "\n      ".join(bad)))
             if bad:
                 failures += 1
-        # Every button on the page, including the send-to-cash-flow buttons.
-        for idx in range(len(a.button)):
-            b = AppTest.from_file(APP, default_timeout=400).run()
+        # Every button on the page, by label rather than by index. Index-based
+        # iteration broke once the sidebar gained a Sign out button, and a
+        # destructive click part-way through shifted everything after it.
+        labels = [str(x.label) for x in a.button if str(x.label) != "Sign out"]
+        for label_b in labels:
+            b = app_for().run()
             b.sidebar.radio[0].set_value("Payroll").run()
-            b.selectbox[0].set_value(name).run()
-            if idx >= len(b.button):
+            try:
+                b.selectbox[0].set_value(name).run()
+            except Exception as exc:
+                print("FAIL   button '" + label_b[:44]
+                      + "' could not reselect the period: " + str(exc)[:120])
+                failures += 1
+                copy_real_data()
                 continue
-            label_b = b.button[idx].label
-            b.button[idx].click().run()
+            target = next((x for x in b.button if str(x.label) == label_b), None)
+            if target is None:
+                continue
+            target.click().run()
             bad = [str(x.value) for x in b.exception]
             print(("FAIL " if bad else "ok   ")
-                  + f"  button {idx} '{label_b[:44]}'"
+                  + f"  button '{label_b[:44]}'"
                   + ("" if not bad else "\n      " + "\n      ".join(bad)))
             if bad:
                 failures += 1
+            # Deleting a saved period really does delete it, so put the test
+            # data back before the next click.
+            if "Delete" in label_b:
+                copy_real_data()
 
     # Sage Actuals with a real statement selected.
     for name in sage_names:
-        b = AppTest.from_file(APP, default_timeout=400).run()
+        b = app_for().run()
         b.sidebar.radio[0].set_value("Sage Actuals").run()
         try:
             b.selectbox[0].set_value(name).run()

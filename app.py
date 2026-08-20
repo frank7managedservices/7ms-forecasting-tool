@@ -1161,14 +1161,200 @@ def variance_table(actual_month, forecast_monthly, month):
     return pd.DataFrame(rows)
 
 
+# --------------------------------------------------------------------------
+# Accounts and access levels
+#
+# Three levels. Admin owns the model and the accounts. User records facts:
+# daily log, payroll, terminations, Sage actuals. Viewer reads and nothing
+# more. Passwords are stored as a PBKDF2 hash with a per-user salt, never in
+# plain text and never in the repository.
+# --------------------------------------------------------------------------
+import hashlib
+import hmac
+import secrets as _secrets
+
+ROLES = ["admin", "user", "viewer"]
+MAX_USERS = 3
+ROLE_HELP = {
+    "admin": "Everything, including forecast assumptions and accounts.",
+    "user": "Can record actuals, payroll, terminations and Sage figures. "
+            "Cannot change forecast assumptions or accounts.",
+    "viewer": "Can read every page. Cannot change anything.",
+}
+PBKDF_ROUNDS = 200000
+
+
+def hash_password(password, salt=None):
+    salt = salt or _secrets.token_hex(16)
+    dk = hashlib.pbkdf2_hmac("sha256", str(password).encode("utf-8"),
+                             bytes.fromhex(salt), PBKDF_ROUNDS)
+    return salt + "$" + dk.hex()
+
+
+def verify_password(password, stored):
+    try:
+        salt, want = str(stored).split("$", 1)
+        dk = hashlib.pbkdf2_hmac("sha256", str(password).encode("utf-8"),
+                                 bytes.fromhex(salt), PBKDF_ROUNDS)
+    except Exception:
+        return False
+    return hmac.compare_digest(dk.hex(), want)
+
+
+def load_users():
+    rows = kv_get("users")
+    return rows if isinstance(rows, list) else []
+
+
+def save_users(rows):
+    kv_put("users", rows)
+
+
+def find_user(rows, login):
+    """Match on login or email, case-insensitively, so either one works."""
+    key = str(login or "").strip().lower()
+    if not key:
+        return None
+    for r in rows:
+        if str(r.get("login", "")).strip().lower() == key:
+            return r
+        if str(r.get("email", "")).strip().lower() == key:
+            return r
+    return None
+
+
+def current_user():
+    return st.session_state.get("auth_user")
+
+
+def role_of():
+    u = current_user()
+    return str(u.get("role", "viewer")) if u else "viewer"
+
+
+def require_login():
+    """Show the sign-in screen and stop unless someone is signed in."""
+    if current_user():
+        return
+    users = load_users()
+    st.title("7MS Forecasting Tool")
+    if not users:
+        st.error(
+            "No accounts exist yet, so nobody can sign in. The administrator "
+            "account has to be created directly in the database before this "
+            "page will let anyone through."
+        )
+        st.stop()
+    st.subheader("Sign in")
+    with st.form("sign_in"):
+        who = st.text_input("Username or email")
+        pw = st.text_input("Password", type="password")
+        go = st.form_submit_button("Sign in")
+    if go:
+        found = find_user(users, who)
+        # Verify even when the name is unknown, so a wrong username and a
+        # wrong password take the same time to answer.
+        stored = found.get("password", "") if found else hash_password("x")
+        if found and verify_password(pw, stored):
+            st.session_state["auth_user"] = {
+                "login": found.get("login", ""),
+                "name": found.get("name", found.get("login", "")),
+                "email": found.get("email", ""),
+                "role": found.get("role", "viewer"),
+                "must_change": bool(found.get("must_change", False)),
+            }
+            st.rerun()
+        else:
+            st.error("That username or password is not right.")
+    st.stop()
+
+
+def force_password_change():
+    """A temporary password has to be replaced before anything else happens."""
+    u = current_user()
+    if not u or not u.get("must_change"):
+        return
+    st.title("Choose your password")
+    st.warning(
+        "You are signed in with a temporary password. Set your own before "
+        "going any further. Nobody else can see what you choose, including me."
+    )
+    with st.form("first_password"):
+        a = st.text_input("New password", type="password")
+        b = st.text_input("New password again", type="password")
+        go = st.form_submit_button("Save my password")
+    if go:
+        if len(a) < 10:
+            st.error("Use at least 10 characters.")
+        elif a != b:
+            st.error("Those two do not match.")
+        else:
+            rows = load_users()
+            for r in rows:
+                if str(r.get("login", "")).lower() == str(u["login"]).lower():
+                    r["password"] = hash_password(a)
+                    r["must_change"] = False
+            save_users(rows)
+            st.session_state["auth_user"]["must_change"] = False
+            st.success("Saved. Opening the app.")
+            st.rerun()
+    st.stop()
+
+
+def read_only_note(what="this page"):
+    st.info(
+        "You are signed in as " + role_of() + ", so " + what + " is read-only. "
+        "You can see every figure but not change anything. Ask Frank if "
+        "something needs editing."
+    )
+
+
+require_login()
+force_password_change()
+
+USER = current_user()
+ROLE = role_of()
+# Two permissions, so every gate below reads plainly. can_enter is about
+# recording what happened. can_configure is about the assumptions the
+# forecast is built on, plus the accounts themselves.
+can_enter = ROLE in ("admin", "user")
+can_configure = ROLE == "admin"
+
 st.sidebar.title("7MS Forecasting Tool")
-page = st.sidebar.radio(
-    "Go to",
-    ["Dashboard", "Forecast", "Payroll", "Terminations", "Sage Actuals",
-     "Cash Flow", "Daily Log", "AI Assistant"],
-)
+PAGES = ["Dashboard", "Forecast", "Payroll", "Terminations", "Sage Actuals",
+         "Cash Flow", "Daily Log", "AI Assistant"]
+if can_configure:
+    PAGES.append("Accounts")
+page = st.sidebar.radio("Go to", PAGES)
 
 storage_note()
+
+st.sidebar.divider()
+st.sidebar.caption("Signed in as " + str(USER.get("name") or USER.get("login")))
+st.sidebar.caption("Access level: " + ROLE + ". " + ROLE_HELP.get(ROLE, ""))
+with st.sidebar.expander("Change my password"):
+    with st.form("own_password"):
+        cur_pw = st.text_input("Current password", type="password")
+        new_a = st.text_input("New password", type="password")
+        new_b = st.text_input("New password again", type="password")
+        changed = st.form_submit_button("Update")
+    if changed:
+        rows = load_users()
+        me = find_user(rows, USER.get("login"))
+        if not me or not verify_password(cur_pw, me.get("password", "")):
+            st.error("Current password is not right.")
+        elif len(new_a) < 10:
+            st.error("Use at least 10 characters.")
+        elif new_a != new_b:
+            st.error("Those two do not match.")
+        else:
+            me["password"] = hash_password(new_a)
+            me["must_change"] = False
+            save_users(rows)
+            st.success("Password updated.")
+if st.sidebar.button("Sign out"):
+    st.session_state.pop("auth_user", None)
+    st.rerun()
 
 st.title(page)
 
@@ -1681,7 +1867,7 @@ elif page == "Payroll":
         "decimo and vacation provisions, which is how your books carry it."
     )
     bc1, bc2 = st.columns(2)
-    if bc1.button("Send cash basis numbers"):
+    if bc1.button("Send cash basis numbers", disabled=not can_enter):
         saved = load_settings()
         saved["payroll"] = round(monthly_payroll, 2)
         saved["css"] = round(monthly_css, 2)
@@ -1696,7 +1882,7 @@ elif page == "Payroll":
             + MONEY.format(monthly_payroll) + " per month, decimo "
             + MONEY.format(decimo_payment) + " per payment, no provisions."
         )
-    if bc2.button("Send accrual basis numbers"):
+    if bc2.button("Send accrual basis numbers", disabled=not can_enter):
         saved = load_settings()
         saved["payroll"] = round(regular_payroll, 2)
         saved["css"] = round(monthly_css, 2)
@@ -1725,7 +1911,7 @@ elif page == "Payroll":
         default_name = str(meta.get("Detalle") or "period").strip()[:120]
         label = st.text_input("Name for this period", value=default_name)
         s1, s2 = st.columns(2)
-        if s1.button("Save to database"):
+        if s1.button("Save to database", disabled=not can_enter):
             if doc_put("payroll", label, df, notes=json.dumps(meta, default=str)):
                 st.success(f"Saved as {label}. Pick it from the list next time.")
         if choice != "Upload a new file" and s2.button("Delete this saved period"):
@@ -1824,7 +2010,7 @@ elif page == "Terminations":
         }
 
     if st.session_state.get("pending_termination"):
-        if st.button("Add to upcoming payments"):
+        if st.button("Add to upcoming payments", disabled=not can_enter):
             add_termination(st.session_state.pop("pending_termination"))
             st.success("Added. It now appears in the Cash Flow projection.")
 
@@ -2070,7 +2256,8 @@ elif page == "Sage Actuals":
                 plan = plan.sort_values("Sage monthly average", ascending=False)
                 edited = st.data_editor(
                     plan, use_container_width=True, hide_index=True,
-                    disabled=["Line", "Sage monthly average"],
+                    disabled=(True if not can_configure
+                              else ["Line", "Sage monthly average"]),
                     column_config={
                         "Sage monthly average": st.column_config.NumberColumn(
                             format="$%.2f"),
@@ -2100,7 +2287,8 @@ elif page == "Sage Actuals":
                     })
 
                 u1, u2 = st.columns(2)
-                if u1.button("Use the Sage average as my other fixed expenses"):
+                if u1.button("Use the Sage average as my other fixed expenses",
+                             disabled=not can_configure):
                     saved = load_settings()
                     saved["fixed"] = round(monthly_other, 2)
                     save_settings(saved)
@@ -2148,7 +2336,8 @@ elif page == "Sage Actuals":
                                             value=source_name or "income statement",
                                             key="name_is")
                     b1, b2 = st.columns(2)
-                    if b1.button("Save to database", key="save_is"):
+                    if b1.button("Save to database", key="save_is",
+                                 disabled=not can_enter):
                         raw_put("sage_is", name_is, body_is,
                                 notes=f"{len(periods)} periods")
                         st.success(f"Saved as {name_is}.")
@@ -2252,7 +2441,8 @@ elif page == "Sage Actuals":
                                             value=gl_name or "general ledger",
                                             key="name_gl")
                     g1, g2 = st.columns(2)
-                    if g1.button("Save to database", key="save_gl"):
+                    if g1.button("Save to database", key="save_gl",
+                                 disabled=not can_enter):
                         raw_put("sage_gl", name_gl, body_gl,
                                 notes=f"{len(gl):,} transactions")
                         st.success(f"Saved as {name_gl}.")
@@ -2264,6 +2454,8 @@ elif page == "Sage Actuals":
                     st.warning("No database configured, so this cannot be saved yet.")
 
 elif page == "Cash Flow":
+    if not can_configure:
+        read_only_note("the forecast assumptions on this page")
     st.write("Cash position projected forward from today using your payment timing rules.")
     saved = load_settings()
 
@@ -2434,6 +2626,7 @@ elif page == "Cash Flow":
                 ]),
                 num_rows="dynamic", use_container_width=True, hide_index=True,
                 key="expense_editor",
+                disabled=not can_configure,
                 column_config={
                     "Monthly amount": st.column_config.NumberColumn(
                         "Monthly amount", format="$%.2f", min_value=0.0),
@@ -2495,6 +2688,7 @@ elif page == "Cash Flow":
             agent_rows = st.data_editor(
                 saved_agents, num_rows="dynamic", use_container_width=True,
                 hide_index=True, key="agent_editor",
+                disabled=not can_configure,
                 column_config={
                     "Agents": st.column_config.NumberColumn(min_value=0, step=1),
                     "Billable hours per agent": st.column_config.NumberColumn(
@@ -2525,6 +2719,7 @@ elif page == "Cash Flow":
             extra_rows = st.data_editor(
                 saved_extra, num_rows="dynamic", use_container_width=True,
                 hide_index=True, key="extra_editor",
+                disabled=not can_configure,
                 column_config={
                     "Expected amount": st.column_config.NumberColumn(
                         min_value=0.0, step=1000.0, format="$%.2f"),
@@ -2556,11 +2751,13 @@ elif page == "Cash Flow":
             revenue_rows = st.data_editor(
                 base_rev, num_rows="dynamic", use_container_width=True,
                 hide_index=True, key="revenue_editor",
+                disabled=not can_configure,
             )
 
         c1, c2 = st.columns(2)
         calculate = c1.form_submit_button("Calculate cash flow")
-        store = c2.form_submit_button("Save these numbers")
+        store = c2.form_submit_button("Save these numbers",
+                                      disabled=not can_configure)
 
     horizon = max((end_date - date.today()).days + 1, 1)
 
@@ -2752,12 +2949,16 @@ elif page == "Cash Flow":
         file_name="cash_settings.json",
         mime="application/json",
     )
-    uploaded = st.file_uploader("Restore settings from a backup file", type="json")
+    uploaded = (st.file_uploader("Restore settings from a backup file",
+                                type="json")
+                if can_configure else None)
     if uploaded is not None:
         save_settings(json.load(uploaded))
         st.success("Restored. Refresh the page to see your numbers.")
 
 elif page == "Daily Log":
+    if not can_enter:
+        read_only_note("the daily log")
     st.write(
         "What actually happened, day by day. Log deposits and payments as they "
         "hit, and type the real bank balance off your online banking. This page "
@@ -2841,51 +3042,61 @@ elif page == "Daily Log":
     st.divider()
 
     # -- add one entry -------------------------------------------------------
-    st.subheader("Log something that happened")
-    with st.form("daily_entry", clear_on_submit=True):
-        f1, f2 = st.columns(2)
-        entry_date = f1.date_input("Date", value=date.today())
-        entry_cat = f2.selectbox("Category", choices)
-        entry_desc = st.text_input(
-            "Description", placeholder="Client X deposit, rent for August")
-        g1, g2 = st.columns(2)
-        amount_in = g1.number_input("Money in", min_value=0.0, step=100.0,
-                                    format="%.2f")
-        amount_out = g2.number_input("Money out", min_value=0.0, step=100.0,
-                                     format="%.2f")
-        added = st.form_submit_button("Add to the log")
-    if added:
-        if amount_in == 0.0 and amount_out == 0.0:
-            st.error("Enter an amount in or out.")
-        else:
-            ledger = save_ledger(pd.concat([ledger, pd.DataFrame([{
-                "Date": entry_date.isoformat(),
-                "Description": entry_desc,
-                "Category": entry_cat,
-                "Money in": float(amount_in),
-                "Money out": float(amount_out),
-            }])], ignore_index=True))
-            st.success("Logged. " + MONEY.format(
-                amount_in if amount_in else amount_out) + " "
-                + ("in" if amount_in else "out") + ".")
-            st.rerun()
-
-    st.subheader("Today's bank balance")
-    with st.form("bank_entry", clear_on_submit=True):
-        b1, b2 = st.columns(2)
-        bank_date = b1.date_input("As of", value=date.today(), key="bankdate")
-        bank_amount = b2.number_input("Balance in the account", step=100.0,
+    # Hidden entirely rather than shown greyed out, since a form you can type
+    # into but never save is worse than no form at all.
+    if not can_enter:
+        st.divider()
+        st.caption(
+            "Entry forms are hidden because your access level is read-only. "
+            "Everything logged is still shown below."
+        )
+    if can_enter:
+      st.subheader("Log something that happened")
+      with st.form("daily_entry", clear_on_submit=True):
+          f1, f2 = st.columns(2)
+          entry_date = f1.date_input("Date", value=date.today())
+          entry_cat = f2.selectbox("Category", choices)
+          entry_desc = st.text_input(
+              "Description", placeholder="Client X deposit, rent for August")
+          g1, g2 = st.columns(2)
+          amount_in = g1.number_input("Money in", min_value=0.0, step=100.0,
                                       format="%.2f")
-        bank_note = st.text_input("Note", placeholder="optional")
-        saved_bank = st.form_submit_button("Save this balance")
-    if saved_bank:
-        bank = save_bank(pd.concat([bank, pd.DataFrame([{
-            "Date": bank_date.isoformat(),
-            "Bank balance": float(bank_amount),
-            "Note": bank_note,
-        }])], ignore_index=True))
-        st.success("Saved.")
-        st.rerun()
+          amount_out = g2.number_input("Money out", min_value=0.0, step=100.0,
+                                       format="%.2f")
+          added = st.form_submit_button("Add to the log", disabled=not can_enter)
+      if added:
+          if amount_in == 0.0 and amount_out == 0.0:
+              st.error("Enter an amount in or out.")
+          else:
+              ledger = save_ledger(pd.concat([ledger, pd.DataFrame([{
+                  "Date": entry_date.isoformat(),
+                  "Description": entry_desc,
+                  "Category": entry_cat,
+                  "Money in": float(amount_in),
+                  "Money out": float(amount_out),
+              }])], ignore_index=True))
+              st.success("Logged. " + MONEY.format(
+                  amount_in if amount_in else amount_out) + " "
+                  + ("in" if amount_in else "out") + ".")
+              st.rerun()
+
+      st.subheader("Today's bank balance")
+      with st.form("bank_entry", clear_on_submit=True):
+          b1, b2 = st.columns(2)
+          bank_date = b1.date_input("As of", value=date.today(), key="bankdate")
+          bank_amount = b2.number_input("Balance in the account", step=100.0,
+                                        format="%.2f")
+          bank_note = st.text_input("Note", placeholder="optional")
+          saved_bank = st.form_submit_button("Save this balance",
+                                             disabled=not can_enter)
+      if saved_bank:
+          bank = save_bank(pd.concat([bank, pd.DataFrame([{
+              "Date": bank_date.isoformat(),
+              "Bank balance": float(bank_amount),
+              "Note": bank_note,
+          }])], ignore_index=True))
+          st.success("Saved.")
+          st.rerun()
 
     st.divider()
 
@@ -2897,6 +3108,7 @@ elif page == "Daily Log":
         edited = st.data_editor(
             ledger, num_rows="dynamic", use_container_width=True,
             hide_index=True, key="ledger_editor",
+            disabled=not can_enter,
             column_config={
                 "Date": st.column_config.TextColumn(
                     "Date", help="YYYY-MM-DD"),
@@ -2908,7 +3120,7 @@ elif page == "Daily Log":
                     "Money out", format="$%.2f", min_value=0.0),
             },
         )
-        if st.button("Save changes to the log"):
+        if st.button("Save changes to the log", disabled=not can_enter):
             save_ledger(edited)
             st.success("Saved.")
             st.rerun()
@@ -2925,12 +3137,13 @@ elif page == "Daily Log":
             edited_bank = st.data_editor(
                 bank, num_rows="dynamic", use_container_width=True,
                 hide_index=True, key="bank_editor",
+                disabled=not can_enter,
                 column_config={
                     "Bank balance": st.column_config.NumberColumn(
                         "Bank balance", format="$%.2f"),
                 },
             )
-            if st.button("Save bank balances"):
+            if st.button("Save bank balances", disabled=not can_enter):
                 save_bank(edited_bank)
                 st.success("Saved.")
                 st.rerun()
@@ -3034,6 +3247,149 @@ elif page == "Daily Log":
         st.line_chart(running.set_index("Date")["Balance"])
         with st.expander("Day by day"):
             money_table(running)
+
+elif page == "Accounts":
+    if not can_configure:
+        st.error("Only an administrator can open this page.")
+        st.stop()
+    st.write(
+        "Up to " + str(MAX_USERS) + " accounts. Passwords are stored as a "
+        "one-way hash, so nobody can read them back, including me. If someone "
+        "forgets theirs, issue a temporary one here and they will be made to "
+        "replace it the moment they sign in."
+    )
+    users = load_users()
+    st.subheader("What each level can do")
+    st.dataframe(
+        pd.DataFrame([{"Level": r, "Can do": ROLE_HELP[r]} for r in ROLES]),
+        use_container_width=True, hide_index=True,
+    )
+
+    st.subheader("Accounts")
+    if not users:
+        st.info("No accounts yet.")
+    else:
+        st.dataframe(
+            pd.DataFrame([{
+                "Username": u.get("login", ""),
+                "Name": u.get("name", ""),
+                "Email": u.get("email", ""),
+                "Level": u.get("role", "viewer"),
+                "Must change password": bool(u.get("must_change", False)),
+            } for u in users]),
+            use_container_width=True, hide_index=True,
+        )
+
+    st.subheader("Add an account")
+    if len(users) >= MAX_USERS:
+        st.info(
+            "You already have " + str(MAX_USERS) + " accounts, which is the "
+            "limit you asked for. Remove one before adding another."
+        )
+    else:
+        with st.form("add_user"):
+            a1, a2 = st.columns(2)
+            with a1:
+                new_login = st.text_input("Username")
+                new_name = st.text_input("Full name")
+            with a2:
+                new_email = st.text_input("Email (optional)")
+                new_role = st.selectbox("Access level", ["user", "viewer"],
+                                        help="Only one administrator is "
+                                             "needed. Change an existing "
+                                             "account below if that must move.")
+            temp_a = st.text_input("Temporary password", type="password")
+            temp_b = st.text_input("Temporary password again", type="password")
+            add = st.form_submit_button("Create account")
+        if add:
+            login_clean = str(new_login).strip().lower()
+            if not login_clean:
+                st.error("A username is required.")
+            elif find_user(users, login_clean):
+                st.error("That username is already taken.")
+            elif new_email and find_user(users, new_email):
+                st.error("That email is already used by another account.")
+            elif len(temp_a) < 10:
+                st.error("Use at least 10 characters for the temporary password.")
+            elif temp_a != temp_b:
+                st.error("Those two do not match.")
+            else:
+                users.append({
+                    "login": login_clean,
+                    "name": str(new_name).strip() or login_clean,
+                    "email": str(new_email).strip(),
+                    "role": new_role,
+                    "password": hash_password(temp_a),
+                    "must_change": True,
+                })
+                save_users(users)
+                st.success(
+                    "Created " + login_clean + " as " + new_role + ". Give them "
+                    "that temporary password in person or by phone, not in "
+                    "writing, and they will be asked to change it on their "
+                    "first sign-in."
+                )
+                st.rerun()
+
+    if users:
+        st.subheader("Change an account")
+        who = st.selectbox("Account", [u.get("login", "") for u in users],
+                           key="edit_which")
+        target = find_user(users, who)
+        admins = [u for u in users if u.get("role") == "admin"]
+        last_admin = (target.get("role") == "admin" and len(admins) <= 1)
+        with st.form("edit_user"):
+            e1, e2 = st.columns(2)
+            with e1:
+                ed_name = st.text_input("Full name", value=target.get("name", ""))
+                ed_email = st.text_input("Email", value=target.get("email", ""))
+            with e2:
+                ed_role = st.selectbox(
+                    "Access level", ROLES,
+                    index=ROLES.index(target.get("role", "viewer")),
+                    disabled=last_admin,
+                    help="Locked, because this is the only administrator left."
+                         if last_admin else ROLE_HELP.get(
+                             target.get("role", "viewer"), ""))
+            reset_a = st.text_input("Set a temporary password (leave blank to "
+                                    "keep the current one)", type="password")
+            apply_it = st.form_submit_button("Apply changes")
+        if apply_it:
+            if reset_a and len(reset_a) < 10:
+                st.error("Use at least 10 characters.")
+            else:
+                target["name"] = str(ed_name).strip() or target.get("login", "")
+                target["email"] = str(ed_email).strip()
+                if not last_admin:
+                    target["role"] = ed_role
+                if reset_a:
+                    target["password"] = hash_password(reset_a)
+                    target["must_change"] = True
+                save_users(users)
+                st.success("Updated " + str(target.get("login", "")) + ".")
+                st.rerun()
+
+        st.subheader("Remove an account")
+        gone = st.selectbox(
+            "Account to remove",
+            [u.get("login", "") for u in users
+             if u.get("login", "") != USER.get("login")],
+            key="remove_which") if len(users) > 1 else None
+        if gone is None:
+            st.caption("There is nothing to remove. You cannot delete the "
+                       "account you are signed in with.")
+        else:
+            sure = st.checkbox("Yes, remove " + str(gone), key="confirm_remove")
+            if st.button("Remove account", disabled=not sure):
+                left = [u for u in users
+                        if str(u.get("login", "")).lower() != str(gone).lower()]
+                if not any(u.get("role") == "admin" for u in left):
+                    st.error("That would leave no administrator. Promote "
+                             "someone else first.")
+                else:
+                    save_users(left)
+                    st.success("Removed " + str(gone) + ".")
+                    st.rerun()
 
 elif page == "AI Assistant":
     st.write("Internal performance assistant.")
